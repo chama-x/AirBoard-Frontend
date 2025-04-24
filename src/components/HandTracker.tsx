@@ -4,14 +4,62 @@ import { HandLandmarker, FilesetResolver, HandLandmarkerResult, NormalizedLandma
 // If using MediaPipe's utils directly, you might need to install @mediapipe/drawing_utils
 // For now, let's use the basic drawing function defined inside.
 
+interface Point { x: number; y: number; z?: number; } // Define a Point type
+
+/**
+ * Applies a moving average smoothing to a path of points
+ */
+const smoothPath = (path: Point[], windowSize: number = 3): Point[] => {
+  if (path.length < windowSize) {
+    return path; // Not enough points to smooth
+  }
+
+  const smoothedPath: Point[] = [];
+  // Ensure window size is odd for a centered average
+  const halfWindow = Math.floor(windowSize / 2);
+
+  for (let i = 0; i < path.length; i++) {
+    let sumX = 0;
+    let sumY = 0;
+    let sumZ = 0;
+    let count = 0;
+
+    for (let j = -halfWindow; j <= halfWindow; j++) {
+      const index = i + j;
+      if (index >= 0 && index < path.length) {
+        sumX += path[index].x;
+        sumY += path[index].y;
+        if (path[index].z !== undefined) {
+             sumZ += path[index].z!;
+        }
+        count++;
+      }
+    }
+
+    if (count > 0) {
+       const avgPoint: Point = { x: sumX / count, y: sumY / count };
+       if (path[i].z !== undefined) { // Preserve Z if it exists
+           avgPoint.z = sumZ / count;
+       }
+       smoothedPath.push(avgPoint);
+    } else {
+        // Should not happen if path.length >= windowSize, but fallback
+        smoothedPath.push(path[i]);
+    }
+  }
+  return smoothedPath;
+};
+
 const HandTracker: React.FC = () => {
   const [handLandmarker, setHandLandmarker] = useState<HandLandmarker | null>(null);
   const [webcamRunning, setWebcamRunning] = useState<boolean>(false);
   const [loading, setLoading] = useState<boolean>(true);
+  const [latestResults, setLatestResults] = useState<HandLandmarkerResult | null>(null);
+  const [isRecording, setIsRecording] = useState<boolean>(false);
+  const [currentPath, setCurrentPath] = useState<Point[]>([]);
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const requestRef = useRef<number | null>(null); // For requestAnimationFrame handle
-  const resultsRef = useRef<HandLandmarkerResult | null>(null); // To store latest results for drawing
 
   // --- Basic Drawing Utility ---
   const drawLandmarks = (ctx: CanvasRenderingContext2D, landmarks: NormalizedLandmark[]) => {
@@ -75,87 +123,136 @@ const HandTracker: React.FC = () => {
 
 
   // --- Webcam Handling & Prediction Loop ---
-  const predictWebcam = useCallback(async () => {
-    console.log('predictWebcam loop running...');
+  const predictWebcam = useCallback(() => {
+    console.log('predictWebcam called...');
     
-    if (!handLandmarker || !webcamRunning || !videoRef.current || !canvasRef.current) {
+    if (!handLandmarker || !webcamRunning || !videoRef.current || videoRef.current.readyState < 2) {
       return;
     }
 
     const video = videoRef.current;
-    const canvasCtx = canvasRef.current.getContext("2d");
+    const startTimeMs = performance.now();
+    const detectionResults = handLandmarker.detectForVideo(video, startTimeMs);
+    setLatestResults(detectionResults); // Update state instead of ref
+    console.log('Detection Results:', detectionResults);
 
-    if (canvasCtx && video.readyState >= 2) { // Check if video has enough data
-        // Ensure canvas dimensions match video display dimensions
-        if (canvasRef.current.width !== video.videoWidth) {
-             canvasRef.current.width = video.videoWidth;
-        }
-        if (canvasRef.current.height !== video.videoHeight) {
-             canvasRef.current.height = video.videoHeight;
-        }
-
-
-        const startTimeMs = performance.now();
-        const detectionResults = handLandmarker.detectForVideo(video, startTimeMs);
-        resultsRef.current = detectionResults; // Store results for drawing
-        console.log('Detection Results:', resultsRef.current);
-
-        // Draw results
-        canvasCtx.save();
-        canvasCtx.clearRect(0, 0, canvasRef.current.width, canvasRef.current.height);
-        if (resultsRef.current && resultsRef.current.landmarks) {
-            console.log('Drawing landmarks for', resultsRef.current.landmarks.length, 'hands');
-            for (const landmarks of resultsRef.current.landmarks) {
-                 drawLandmarks(canvasCtx, landmarks);
-                 // Log index finger tip coordinates (landmark 8) - Normalized
-                 // if (landmarks[8]) {
-                 //     console.log("Index Finger Tip (Normalized):", landmarks[8]);
-                 // }
-            }
-        }
-        canvasCtx.restore();
-    }
-
-    // Call this function again to keep predicting when the browser is ready.
-    if (webcamRunning) {
-      requestRef.current = requestAnimationFrame(predictWebcam);
-    }
   }, [handLandmarker, webcamRunning]); // Dependencies for the callback
 
 
   // --- Effect to Start/Stop Loop ---
    useEffect(() => {
     let animationFrameId: number | null = null;
-    if (webcamRunning && handLandmarker && videoRef.current && videoRef.current.readyState >= 2) {
-       // Start the loop
-       const loop = () => {
-           predictWebcam();
-           animationFrameId = requestAnimationFrame(loop);
-       };
-       animationFrameId = requestAnimationFrame(loop);
 
+    const renderLoop = () => {
+        if (!webcamRunning || !handLandmarker) { // Stop loop if conditions unmet
+             if (animationFrameId) cancelAnimationFrame(animationFrameId);
+             return;
+        }
+
+        // Call predictWebcam to get results for the *next* frame and update state
+        predictWebcam();
+
+        // --- Drawing ---
+        const canvasCtx = canvasRef.current?.getContext("2d");
+        if (canvasCtx && canvasRef.current) {
+            // Match canvas size to video
+            if (canvasRef.current.width !== videoRef.current?.videoWidth) {
+                 canvasRef.current.width = videoRef.current?.videoWidth || 640;
+            }
+            if (canvasRef.current.height !== videoRef.current?.videoHeight) {
+                 canvasRef.current.height = videoRef.current?.videoHeight || 480;
+            }
+
+            canvasCtx.save();
+            canvasCtx.clearRect(0, 0, canvasRef.current.width, canvasRef.current.height);
+            // Draw based on the LATEST results stored in state
+            if (latestResults && latestResults.landmarks && latestResults.landmarks.length > 0) {
+                console.log('Drawing landmarks for', latestResults.landmarks.length, 'hands');
+                for (const landmarks of latestResults.landmarks) {
+                    drawLandmarks(canvasCtx, landmarks);
+                }
+                
+                // Record path if recording is active
+                if (isRecording) {
+                    const landmarks = latestResults.landmarks[0]; // Assuming one hand
+                    if (landmarks && landmarks[8]) { // Check if index finger tip exists
+                        const fingerTip: Point = {
+                            x: landmarks[8].x,
+                            y: landmarks[8].y,
+                            z: landmarks[8].z // Include z if available/needed
+                        };
+                        // Use functional update for state arrays for better performance potentially
+                        setCurrentPath(prevPath => [...prevPath, fingerTip]);
+                    }
+                }
+            }
+            
+            // Draw the recorded path
+            if (currentPath.length > 1) {
+                canvasCtx.strokeStyle = "#FFFFFF"; // White path
+                canvasCtx.lineWidth = 3;
+                canvasCtx.beginPath();
+                canvasCtx.moveTo(currentPath[0].x * canvasRef.current.width, currentPath[0].y * canvasRef.current.height);
+                for (let i = 1; i < currentPath.length; i++) {
+                    canvasCtx.lineTo(currentPath[i].x * canvasRef.current.width, currentPath[i].y * canvasRef.current.height);
+                }
+                canvasCtx.stroke();
+            }
+            
+            canvasCtx.restore();
+        }
+        // Schedule next frame
+        animationFrameId = requestAnimationFrame(renderLoop);
+    };
+
+    if (webcamRunning && handLandmarker) {
+        animationFrameId = requestAnimationFrame(renderLoop); // Start loop
     } else {
-      // Stop the loop if running
-      if (animationFrameId) {
-          cancelAnimationFrame(animationFrameId);
-          animationFrameId = null;
-      }
-      // Clear canvas when webcam stops
-      if (canvasRef.current) {
-         const canvasCtx = canvasRef.current.getContext("2d");
-         if (canvasCtx) {
-             canvasCtx.clearRect(0, 0, canvasRef.current.width, canvasRef.current.height);
-         }
-      }
+        if (animationFrameId) cancelAnimationFrame(animationFrameId); // Clear if stopped
+        // Clear canvas
+        const canvasCtx = canvasRef.current?.getContext("2d");
+        if (canvasCtx && canvasRef.current) {
+            canvasCtx.clearRect(0, 0, canvasRef.current.width, canvasRef.current.height);
+        }
     }
+
     // Cleanup animation frame on component unmount or when dependencies change
     return () => {
       if (animationFrameId) {
         cancelAnimationFrame(animationFrameId);
       }
     };
-  }, [webcamRunning, handLandmarker, predictWebcam]); // Rerun effect if these change
+  }, [webcamRunning, handLandmarker, predictWebcam, latestResults, videoRef, isRecording, currentPath]); // Added isRecording and currentPath to dependencies
 
+
+  // --- Drawing Controls ---
+  const handleStartDrawing = () => {
+    if (!webcamRunning) return; // Only start if webcam is on
+    console.log("Starting path recording...");
+    setCurrentPath([]); // Clear previous path
+    setIsRecording(true);
+  };
+
+  const handleStopDrawing = () => {
+    if (!isRecording) return;
+    console.log("Stopping path recording...");
+    setIsRecording(false);
+
+    const rawPath = [...currentPath]; // Create a copy before clearing state
+
+    // Smooth the path (use a small window like 3 or 5)
+    const smoothingWindowSize = 3;
+    const smoothedPath = smoothPath(rawPath, smoothingWindowSize);
+
+    // Log both paths for comparison
+    console.log("Raw Path Recorded (Points):", rawPath.length, rawPath);
+    console.log(`Smoothed Path (Window ${smoothingWindowSize}, Points):`, smoothedPath.length, smoothedPath);
+
+    // Clear the path for the next drawing
+    setCurrentPath([]);
+
+    // Later: Send the 'smoothedPath' to the backend instead of rawPath
+  };
 
   // --- Enable/Disable Webcam ---
   const enableCam = async () => {
@@ -167,8 +264,7 @@ const HandTracker: React.FC = () => {
           const stream = await navigator.mediaDevices.getUserMedia(constraints);
           if (videoRef.current) {
               videoRef.current.srcObject = stream;
-              // Add event listener to start prediction loop once video is playing
-              videoRef.current.addEventListener('loadeddata', predictWebcam);
+              videoRef.current.play();
           }
       } catch (err) {
           console.error("ERROR: getUserMedia() error:", err);
@@ -178,8 +274,8 @@ const HandTracker: React.FC = () => {
 
   const disableCam = () => {
       setWebcamRunning(false); // Set state to not running
+      setIsRecording(false); // Stop recording if active
       if (videoRef.current) {
-          videoRef.current.removeEventListener('loadeddata', predictWebcam); // Remove listener
           if (videoRef.current.srcObject) {
               const tracks = (videoRef.current.srcObject as MediaStream).getTracks();
               tracks.forEach(track => track.stop()); // Stop all tracks
@@ -230,6 +326,42 @@ const HandTracker: React.FC = () => {
                 display: webcamRunning ? 'block' : 'none'
               }}
             />
+            
+            <button 
+              onClick={handleStartDrawing} 
+              disabled={!webcamRunning || isRecording || loading} 
+              style={{
+                position: 'absolute', 
+                bottom: '50px', 
+                left: '10px', 
+                zIndex: 10, 
+                padding: '10px', 
+                backgroundColor: isRecording ? 'grey' : 'lightgreen',
+                color: 'black',
+                fontSize: '14px',
+                border: '2px solid black'
+              }}
+            >
+              Start Drawing
+            </button>
+            
+            <button 
+              onClick={handleStopDrawing} 
+              disabled={!webcamRunning || !isRecording || loading} 
+              style={{
+                position: 'absolute', 
+                bottom: '50px', 
+                left: '150px', 
+                zIndex: 10, 
+                padding: '10px', 
+                backgroundColor: !isRecording ? 'grey' : 'orange',
+                color: 'black',
+                fontSize: '14px',
+                border: '2px solid black'
+              }}
+            >
+              Stop Drawing
+            </button>
           </div>
           
           <div className="controls">
