@@ -7,9 +7,299 @@ import { HandLandmarker, FilesetResolver, HandLandmarkerResult, NormalizedLandma
 interface Point { x: number; y: number; z?: number; } // Define a Point type
 type WsStatus = 'disconnected' | 'connecting' | 'connected' | 'error';
 
+// Kalman Filter Parameters - Tunable constants
+const PROCESS_NOISE_Q = 0.01; // Process noise - how much we expect the motion model to be incorrect (smaller = smoother but more laggy)
+const MEASUREMENT_NOISE_R = 0.1; // Measurement noise - how much we expect the measurements to be noisy (higher = trust measurements less)
+const INITIAL_COVARIANCE_P = 1.0; // Initial state covariance - higher means less trust in initial state
+const DT = 1/30; // Time delta between frames in seconds - 30 FPS assumption
+const VELOCITY_STOP_THRESHOLD = 0.000001; // Velocity threshold for auto-stopping recording (needs tuning)
+
 /**
- * Applies a moving average smoothing to a path of points
+ * 2D Kalman Filter for smoothing finger tip trajectories
+ * State vector: [x, y, vx, vy] - position and velocity in 2D
  */
+class KalmanFilter2D {
+  // State vector [x, y, vx, vy]
+  private x: number[];
+  // State covariance matrix (4x4)
+  private P: number[][];
+  // State transition matrix (4x4)
+  private A: number[][];
+  // Measurement matrix (2x4)
+  private H: number[][];
+  // Process noise covariance (4x4)
+  private Q: number[][];
+  // Measurement noise covariance (2x2)
+  private R: number[][];
+  // Identity matrix (4x4)
+  private I: number[][];
+  // Last time update was called
+  private lastTimestamp: number | null = null;
+
+  constructor(initialX = 0, initialY = 0, processNoise = PROCESS_NOISE_Q, measurementNoise = MEASUREMENT_NOISE_R) {
+    // Initialize state vector [x, y, vx, vy]
+    this.x = [initialX, initialY, 0, 0];
+
+    // Initialize state covariance with uncertainty
+    this.P = [
+      [INITIAL_COVARIANCE_P, 0, 0, 0],
+      [0, INITIAL_COVARIANCE_P, 0, 0],
+      [0, 0, INITIAL_COVARIANCE_P, 0],
+      [0, 0, 0, INITIAL_COVARIANCE_P]
+    ];
+
+    // State transition matrix for constant velocity model
+    this.A = [
+      [1, 0, DT, 0],  // x = x + vx*dt
+      [0, 1, 0, DT],  // y = y + vy*dt
+      [0, 0, 1, 0],   // vx = vx
+      [0, 0, 0, 1]    // vy = vy
+    ];
+
+    // Measurement matrix - we only measure position, not velocity
+    this.H = [
+      [1, 0, 0, 0],  // Measure x
+      [0, 1, 0, 0]   // Measure y
+    ];
+
+    // Process noise covariance - uncertainty in the motion model
+    this.Q = [
+      [processNoise, 0, 0, 0],
+      [0, processNoise, 0, 0],
+      [0, 0, processNoise * 2, 0], // Higher for velocity components
+      [0, 0, 0, processNoise * 2]
+    ];
+
+    // Measurement noise covariance - uncertainty in measurements
+    this.R = [
+      [measurementNoise, 0],
+      [0, measurementNoise]
+    ];
+
+    // Identity matrix
+    this.I = [
+      [1, 0, 0, 0],
+      [0, 1, 0, 0],
+      [0, 0, 1, 0],
+      [0, 0, 0, 1]
+    ];
+  }
+
+  /**
+   * Reset the filter with new initial position
+   */
+  reset(x: number, y: number): void {
+    this.x = [x, y, 0, 0];
+    this.P = [
+      [INITIAL_COVARIANCE_P, 0, 0, 0],
+      [0, INITIAL_COVARIANCE_P, 0, 0],
+      [0, 0, INITIAL_COVARIANCE_P, 0],
+      [0, 0, 0, INITIAL_COVARIANCE_P]
+    ];
+    this.lastTimestamp = null;
+  }
+
+  /**
+   * Update the time delta based on actual frame timing
+   */
+  private updateTimeDelta(timestamp: number): void {
+    if (this.lastTimestamp === null) {
+      // First frame, use default DT
+      this.lastTimestamp = timestamp;
+      return;
+    }
+
+    const dt = (timestamp - this.lastTimestamp) / 1000; // Convert to seconds
+    if (dt > 0 && dt < 1) { // Sanity check - not too small or large
+      // Update state transition matrix with new dt
+      this.A[0][2] = dt;
+      this.A[1][3] = dt;
+    }
+    this.lastTimestamp = timestamp;
+  }
+
+  /**
+   * Predict step - project state forward
+   */
+  predict(timestamp?: number): void {
+    // Update time delta if timestamp provided
+    if (timestamp) {
+      this.updateTimeDelta(timestamp);
+    }
+
+    // x = A * x (matrix multiplication)
+    const newX = [0, 0, 0, 0];
+    for (let i = 0; i < 4; i++) {
+      for (let j = 0; j < 4; j++) {
+        newX[i] += this.A[i][j] * this.x[j];
+      }
+    }
+    this.x = newX;
+
+    // P = A * P * A^T + Q
+    // 1. Calculate A * P
+    const AP = matrixMultiply(this.A, this.P);
+    // 2. Calculate (A * P) * A^T
+    const APAT = matrixMultiply(AP, matrixTranspose(this.A));
+    // 3. Add Q
+    this.P = matrixAdd(APAT, this.Q);
+  }
+
+  /**
+   * Update step - correct prediction with measurement
+   */
+  update(z: [number, number]): [number, number] {
+    // y = z - H * x (measurement residual)
+    const Hx = [0, 0];
+    for (let i = 0; i < 2; i++) {
+      for (let j = 0; j < 4; j++) {
+        Hx[i] += this.H[i][j] * this.x[j];
+      }
+    }
+    const y = [z[0] - Hx[0], z[1] - Hx[1]];
+
+    // S = H * P * H^T + R (residual covariance)
+    const HP = matrixMultiply(this.H, this.P);
+    const HPHt = matrixMultiply(HP, matrixTranspose(this.H));
+    const S = matrixAdd(HPHt, this.R);
+
+    // K = P * H^T * S^-1 (Kalman gain)
+    const PHt = matrixMultiply(this.P, matrixTranspose(this.H));
+    const SInv = matrixInverse2x2(S); // Specialized 2x2 inversion for efficiency
+    const K = matrixMultiply(PHt, SInv);
+
+    // x = x + K * y (update state estimate)
+    const Ky = [0, 0, 0, 0];
+    for (let i = 0; i < 4; i++) {
+      for (let j = 0; j < 2; j++) {
+        Ky[i] += K[i][j] * y[j];
+      }
+    }
+    for (let i = 0; i < 4; i++) {
+      this.x[i] += Ky[i];
+    }
+
+    // P = (I - K * H) * P (update estimate covariance)
+    const KH = matrixMultiply(K, this.H);
+    const IMinusKH = matrixSubtract(this.I, KH);
+    this.P = matrixMultiply(IMinusKH, this.P);
+
+    // Return filtered position [x, y]
+    return [this.x[0], this.x[1]];
+  }
+
+  /**
+   * Process a new measurement and return filtered position
+   */
+  process(x: number, y: number, timestamp?: number): [number, number] {
+    this.predict(timestamp);
+    return this.update([x, y]);
+  }
+
+  /**
+   * Get current state components
+   * @returns Copy of current state [x, y, vx, vy]
+   */
+  getState(): number[] {
+    // Use spread operator to create a copy of the state vector
+    return [this.x[0], this.x[1], this.x[2], this.x[3]];
+  }
+  
+  /**
+   * Get the current velocity components
+   * @returns [vx, vy] - Velocity components
+   */
+  getVelocity(): [number, number] {
+    const state = this.getState();
+    return [state[2], state[3]];
+  }
+  
+  /**
+   * Get the current speed (magnitude of velocity)
+   * @returns speed
+   */
+  getSpeed(): number {
+    const [vx, vy] = this.getVelocity();
+    return Math.sqrt(vx * vx + vy * vy);
+  }
+}
+
+// Matrix operations helpers
+function matrixMultiply(a: number[][], b: number[][]): number[][] {
+  const aRows = a.length;
+  const aCols = a[0].length;
+  const bCols = b[0].length;
+  const result: number[][] = Array(aRows).fill(0).map(() => Array(bCols).fill(0));
+
+  for (let i = 0; i < aRows; i++) {
+    for (let j = 0; j < bCols; j++) {
+      for (let k = 0; k < aCols; k++) {
+        result[i][j] += a[i][k] * b[k][j];
+      }
+    }
+  }
+  return result;
+}
+
+function matrixTranspose(m: number[][]): number[][] {
+  const rows = m.length;
+  const cols = m[0].length;
+  const result: number[][] = Array(cols).fill(0).map(() => Array(rows).fill(0));
+
+  for (let i = 0; i < rows; i++) {
+    for (let j = 0; j < cols; j++) {
+      result[j][i] = m[i][j];
+    }
+  }
+  return result;
+}
+
+function matrixAdd(a: number[][], b: number[][]): number[][] {
+  const rows = a.length;
+  const cols = a[0].length;
+  const result: number[][] = Array(rows).fill(0).map(() => Array(cols).fill(0));
+
+  for (let i = 0; i < rows; i++) {
+    for (let j = 0; j < cols; j++) {
+      result[i][j] = a[i][j] + b[i][j];
+    }
+  }
+  return result;
+}
+
+function matrixSubtract(a: number[][], b: number[][]): number[][] {
+  const rows = a.length;
+  const cols = a[0].length;
+  const result: number[][] = Array(rows).fill(0).map(() => Array(cols).fill(0));
+
+  for (let i = 0; i < rows; i++) {
+    for (let j = 0; j < cols; j++) {
+      result[i][j] = a[i][j] - b[i][j];
+    }
+  }
+  return result;
+}
+
+// Special case for inverting a 2x2 matrix (used in Kalman filter)
+function matrixInverse2x2(m: number[][]): number[][] {
+  const det = m[0][0] * m[1][1] - m[0][1] * m[1][0];
+  if (Math.abs(det) < 1e-10) {
+    // Avoid division by zero or very small values
+    return [[1, 0], [0, 1]]; // Return identity as fallback
+  }
+
+  const invDet = 1 / det;
+  return [
+    [m[1][1] * invDet, -m[0][1] * invDet],
+    [-m[1][0] * invDet, m[0][0] * invDet]
+  ];
+}
+
+/**
+ * Legacy moving average smoothing - kept for reference or fallback
+ * @deprecated This function is kept for reference only - we now use Kalman filtering
+ */
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
 const smoothPath = (path: Point[], windowSize: number = 3): Point[] => {
   if (path.length < windowSize) {
     return path; // Not enough points to smooth
@@ -59,7 +349,6 @@ const HandTracker: React.FC = () => {
   const [isRecording, setIsRecording] = useState<boolean>(false);
   const [currentPath, setCurrentPath] = useState<Point[]>([]);
   const [digitToDraw, setDigitToDraw] = useState<number | null>(null);
-  const [lastPath, setLastPath] = useState<Point[] | null>(null); // Keep to store path on stop
   const [ws, setWs] = useState<WebSocket | null>(null);
   const [wsStatus, setWsStatus] = useState<WsStatus>('disconnected');
   const [predictedDigit, setPredictedDigit] = useState<number | string | null>(null);
@@ -67,27 +356,139 @@ const HandTracker: React.FC = () => {
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const requestRef = useRef<number | null>(null); // For requestAnimationFrame handle
+  const kalmanFilterRef = useRef<KalmanFilter2D | null>(null); // Kalman filter instance
+  const lastFrameTimeRef = useRef<number>(0); // Track last frame time for dt calculation
+
+  // --- Basic Drawing Utility ---
+  const drawLandmarks = (ctx: CanvasRenderingContext2D, landmarks: NormalizedLandmark[]) => {
+      if (!landmarks) return;
+      // Simple drawing: draw circles for landmarks (index finger tip: 8)
+      ctx.fillStyle = '#FF0000'; // Red
+      ctx.strokeStyle = '#00FF00'; // Green for connectors (optional)
+      ctx.lineWidth = 2;
+
+      landmarks.forEach((landmark: NormalizedLandmark, index: number) => {
+          const x = landmark.x * ctx.canvas.width;
+          const y = landmark.y * ctx.canvas.height;
+          ctx.beginPath();
+          ctx.arc(x, y, 5, 0, 2 * Math.PI); // Draw circle
+          ctx.fill();
+          // Highlight index finger tip (landmark 8)
+          if (index === 8) {
+             ctx.fillStyle = '#0000FF'; // Blue
+             ctx.beginPath();
+             ctx.arc(x, y, 7, 0, 2 * Math.PI);
+             ctx.fill();
+             ctx.fillStyle = '#FF0000'; // Reset color
+          }
+      });
+      // Add drawing connectors if needed (e.g., using HandLandmarker.HAND_CONNECTIONS)
+  };
 
   // --- Fetch Next Digit Prompt ---
   const fetchNextDigitPrompt = async () => {
     try {
-        // Assume backend runs on localhost:8000
-        // Use http:// not ws:// for this standard GET request
-        const response = await fetch('http://localhost:8000/next_digit_prompt');
-        if (!response.ok) {
-            throw new Error(`HTTP error! status: ${response.status}`);
-        }
-        const data = await response.json();
-        if (data && data.digit_to_draw !== undefined) {
-            console.log("Received prompt to draw digit:", data.digit_to_draw);
-            setDigitToDraw(data.digit_to_draw);
+      // Try to fetch from backend directly (now that CORS is implemented on backend)
+      try {
+        // Use direct backend URL
+        const backendUrl = 'http://localhost:8000/next_digit_prompt';
+        console.log("Attempting to fetch digit prompt from backend:", backendUrl);
+        
+        const response = await fetch(backendUrl, {
+          method: 'GET',
+          headers: {
+            'Accept': 'application/json',
+          },
+          // Use longer timeout
+          signal: AbortSignal.timeout(5000) // 5 second timeout
+        });
+        
+        console.log("Fetch response status:", response.status);
+        
+        if (response.ok) {
+          const responseText = await response.text();
+          console.log("Raw response:", responseText);
+          
+          try {
+            const data = JSON.parse(responseText);
+            console.log("Parsed data:", data);
+            
+            if (data && data.digit_to_draw !== undefined) {
+              console.log("Successfully received prompt to draw digit:", data.digit_to_draw);
+              setDigitToDraw(data.digit_to_draw);
+              return; // Successfully got digit from backend
+            } else {
+              console.warn("Response missing digit_to_draw:", data);
+              throw new Error("Invalid response format");
+            }
+          } catch (parseError) {
+            console.error("Error parsing JSON:", parseError, "Raw text:", responseText);
+            throw new Error("Failed to parse JSON response");
+          }
         } else {
-             console.error("Received invalid prompt data:", data);
-             setDigitToDraw(null); // Indicate error or inability to get prompt
+          console.warn(`Server responded with status: ${response.status}`);
+          throw new Error(`HTTP error! status: ${response.status}`);
         }
+      } catch (fetchError) {
+        console.error("Fetch error details:", fetchError);
+        
+        // Try a direct XMLHttpRequest as fallback also directly to backend
+        try {
+          console.log("Trying XMLHttpRequest as fallback...");
+          const digit = await new Promise<number>((resolve, reject) => {
+            const xhr = new XMLHttpRequest();
+            xhr.open('GET', 'http://localhost:8000/next_digit_prompt');
+            xhr.setRequestHeader('Accept', 'application/json');
+            xhr.timeout = 5000; // 5 second timeout
+            
+            xhr.onload = function() {
+              if (xhr.status === 200) {
+                try {
+                  const data = JSON.parse(xhr.responseText);
+                  if (data && data.digit_to_draw !== undefined) {
+                    resolve(data.digit_to_draw);
+                  } else {
+                    reject(new Error("Invalid response format"));
+                  }
+                } catch (parseError: unknown) {
+                  const errorMessage = parseError instanceof Error ? parseError.message : String(parseError);
+                  reject(new Error(`Failed to parse response: ${errorMessage}`));
+                }
+              } else {
+                reject(new Error(`XHR error, status: ${xhr.status}`));
+              }
+            };
+            
+            xhr.onerror = function() {
+              reject(new Error("XHR network error"));
+            };
+            
+            xhr.ontimeout = function() {
+              reject(new Error("XHR request timed out"));
+            };
+            
+            xhr.send();
+          });
+          
+          console.log("XHR success, got digit:", digit);
+          setDigitToDraw(digit);
+          return;
+        } catch (xhrError) {
+          console.warn("XMLHttpRequest also failed:", xhrError);
+          
+          // Fall back to random digit
+          console.warn("All backend requests failed, using local fallback");
+          const randomDigit = Math.floor(Math.random() * 10);
+          console.log("Using locally generated random digit:", randomDigit);
+          setDigitToDraw(randomDigit);
+        }
+      }
     } catch (error) {
-        console.error("Error fetching next digit prompt:", error);
-        setDigitToDraw(null); // Indicate error
+      console.error("Unhandled error in fetchNextDigitPrompt:", error);
+      // Last resort fallback
+      const emergencyDigit = Math.floor(Math.random() * 10);
+      console.log("Emergency fallback - using random digit:", emergencyDigit);
+      setDigitToDraw(emergencyDigit);
     }
   };
 
@@ -95,6 +496,7 @@ const HandTracker: React.FC = () => {
   useEffect(() => {
     console.log("Attempting WebSocket connection...");
     setWsStatus('connecting');
+    // Also use proxy for WebSocket if needed
     const websocketUrl = 'ws://localhost:8000/ws';
     const socket = new WebSocket(websocketUrl);
 
@@ -216,6 +618,8 @@ const HandTracker: React.FC = () => {
              return;
         }
 
+        const currentTime = performance.now();
+        
         // Call predictWebcam to get results for the *next* frame and update state
         predictWebcam();
 
@@ -243,13 +647,46 @@ const HandTracker: React.FC = () => {
                 if (isRecording) {
                     const landmarks = latestResults.landmarks[0]; // Assuming one hand
                     if (landmarks && landmarks[8]) { // Check if index finger tip exists
-                        const fingerTip: Point = {
+                        const rawFingerTip = {
                             x: landmarks[8].x,
                             y: landmarks[8].y,
                             z: landmarks[8].z // Include z if available/needed
                         };
-                        // Use functional update for state arrays for better performance potentially
-                        setCurrentPath(prevPath => [...prevPath, fingerTip]);
+                        
+                        // Apply Kalman filtering
+                        if (!kalmanFilterRef.current) {
+                            // First detection, initialize the filter
+                            kalmanFilterRef.current = new KalmanFilter2D(rawFingerTip.x, rawFingerTip.y);
+                        }
+                        
+                        // Process through Kalman filter with timestamp
+                        const [filteredX, filteredY] = kalmanFilterRef.current.process(
+                            rawFingerTip.x, 
+                            rawFingerTip.y,
+                            currentTime
+                        );
+                        
+                        // Create filtered point with the same z-value
+                        const filteredFingerTip: Point = {
+                            x: filteredX,
+                            y: filteredY,
+                            z: rawFingerTip.z
+                        };
+                        
+                        // Use functional update for state arrays for better performance
+                        setCurrentPath(prevPath => [...prevPath, filteredFingerTip]);
+                        
+                        // Check velocity for auto-stopping drawing
+                        if (kalmanFilterRef.current) {
+                            const currentSpeed = kalmanFilterRef.current.getSpeed();
+                            
+                            // Auto-stop if speed is below threshold and we've been recording for at least 1 second
+                            // to prevent premature stopping at the beginning of drawing
+                            if (currentSpeed < VELOCITY_STOP_THRESHOLD && currentPath.length > 30) {
+                                console.log(`Auto-stopping: Speed ${currentSpeed.toFixed(6)} < Threshold ${VELOCITY_STOP_THRESHOLD}`);
+                                handleStopDrawing();
+                            }
+                        }
                     }
                 }
             }
@@ -268,6 +705,9 @@ const HandTracker: React.FC = () => {
             
             canvasCtx.restore();
         }
+        
+        lastFrameTimeRef.current = currentTime;
+        
         // Schedule next frame
         animationFrameId = requestAnimationFrame(renderLoop);
     };
@@ -289,7 +729,7 @@ const HandTracker: React.FC = () => {
         cancelAnimationFrame(animationFrameId);
       }
     };
-  }, [webcamRunning, handLandmarker, predictWebcam, latestResults, videoRef, isRecording, currentPath]); // Added isRecording and currentPath to dependencies
+  }, [webcamRunning, handLandmarker, predictWebcam, latestResults, videoRef, isRecording, currentPath]); // Dependencies
 
 
   // --- Drawing Controls ---
@@ -300,6 +740,9 @@ const HandTracker: React.FC = () => {
     setPredictedDigit(null);
     setPredictionConfidence(null);
     setIsRecording(true);
+    
+    // Reset Kalman filter for new drawing
+    kalmanFilterRef.current = null;
   };
 
   const handleStopDrawing = () => {
@@ -308,20 +751,37 @@ const HandTracker: React.FC = () => {
     setIsRecording(false);
 
     const rawPath = [...currentPath];
-    const smoothingWindowSize = 3;
-    const smoothedPath = smoothPath(rawPath, smoothingWindowSize);
+    // We're now using Kalman filter for real-time smoothing, so we don't need the
+    // post-processing moving average filter anymore. The path is already filtered.
+    // const smoothingWindowSize = 3;
+    // const smoothedPath = smoothPath(rawPath, smoothingWindowSize);
+    
+    // Use the Kalman-filtered path directly
+    const filteredPath = rawPath;
 
-    console.log("Raw Path Recorded (Points):", rawPath.length, rawPath);
-    console.log(`Smoothed Path (Window ${smoothingWindowSize}, Points):`, smoothedPath.length, smoothedPath);
+    console.log("Path Recorded (Points):", rawPath.length, rawPath);
+    // console.log(`Smoothed Path (Window ${smoothingWindowSize}, Points):`, smoothedPath.length, smoothedPath);
+    console.log("Kalman Filtered Path (Points):", filteredPath.length);
 
-    if (smoothedPath.length > 1) {
+    if (filteredPath.length > 1) {
         // Immediately submit the path with the prompted label
-        submitDrawing(smoothedPath); // Call submit function
+        submitDrawing(filteredPath); // Call submit function with Kalman-filtered path
     } else {
         console.log("Path too short, skipping submission.");
         setCurrentPath([]); // Clear visual path if too short
         setDigitToDraw(null); // Clear prompt to force user to get next one
     }
+    
+    // Reset Kalman filter after submission
+    kalmanFilterRef.current = null;
+  };
+
+  // Add Reset Drawing functionality
+  const handleResetDrawing = () => {
+    console.log("Drawing reset.");
+    setCurrentPath([]);
+    // Reset Kalman filter as done in handleStartDrawing
+    kalmanFilterRef.current = null;
   };
 
   const submitDrawing = (pathToSend: Point[]) => { // Takes path as argument
@@ -386,190 +846,129 @@ const HandTracker: React.FC = () => {
   console.log("HandTracker Component Render - Loading state:", loading);
 
   return (
-    <div className="hand-tracker-container">
-      <h2>Hand Tracking with MediaPipe</h2>
-      <div className="connection-status" style={{ 
-        marginBottom: '10px',
-        padding: '5px',
-        backgroundColor: 
-          wsStatus === 'connected' ? '#dff0d8' : 
-          wsStatus === 'connecting' ? '#fcf8e3' : 
-          wsStatus === 'error' ? '#f2dede' : '#f8f9fa',
-        color: 
-          wsStatus === 'connected' ? '#3c763d' : 
-          wsStatus === 'connecting' ? '#8a6d3b' : 
-          wsStatus === 'error' ? '#a94442' : '#6c757d',
-        borderRadius: '4px',
-        fontSize: '14px'
-      }}>
-        WebSocket: {wsStatus}
-      </div>
-      
-      <div style={{ margin: '20px auto', textAlign: 'center', height: '80px', width:'100%' }}>
-        {digitToDraw !== null ? (
-             <p style={{ 
-               fontSize: '2.5em', 
-               fontWeight: 'bold', 
-               color: '#4CAF50', 
-               backgroundColor: 'rgba(255, 255, 255, 0.8)',
-               padding: '10px 20px',
-               borderRadius: '8px',
-               display: 'inline-block'
-             }}>
-                 Please Draw: {digitToDraw}
-             </p>
-           ) : (
-             webcamRunning ? (
-                  <button 
-                    onClick={fetchNextDigitPrompt} 
-                    style={{
-                      padding: '12px 20px', 
-                      fontSize: '18px',
-                      backgroundColor: '#2196F3',
-                      color: 'white',
-                      border: 'none',
-                      borderRadius: '4px',
-                      cursor: 'pointer',
-                      boxShadow: '0 2px 5px rgba(0,0,0,0.2)'
-                    }}
-                  >
-                    Get Next Digit
-                  </button>
-             ) : (
-                 <p style={{ 
-                   fontSize: '1.5em', 
-                   color: '#757575',
-                   backgroundColor: 'rgba(255, 255, 255, 0.8)',
-                   padding: '10px',
-                   borderRadius: '4px',
-                   display: 'inline-block'
-                 }}>
-                   Enable webcam to start.
-                 </p>
-             )
-           )
-        }
-      </div>
-      
-      {loading ? (
-        <p>Loading hand tracking model...</p>
-      ) : (
-        <>
-          <div className="video-container" style={{ position: 'relative', border: '3px solid red' }}>
+    <div className="flex flex-col md:flex-row gap-4 p-4 bg-gray-900 text-gray-200 min-h-screen">
+      {/* Left column - Video/Canvas area */}
+      <div className="relative w-full md:w-1/2 lg:w-3/5 border border-gray-700">
+        <h2 className="text-xl mb-4 text-center">Hand Tracking with MediaPipe</h2>
+        
+        <div className="connection-status mb-2 p-1 text-sm rounded" style={{ 
+          backgroundColor: 
+            wsStatus === 'connected' ? '#dff0d8' : 
+            wsStatus === 'connecting' ? '#fcf8e3' : 
+            wsStatus === 'error' ? '#f2dede' : '#f8f9fa',
+          color: 
+            wsStatus === 'connected' ? '#3c763d' : 
+            wsStatus === 'connecting' ? '#8a6d3b' : 
+            wsStatus === 'error' ? '#a94442' : '#6c757d',
+        }}>
+          WebSocket: {wsStatus}
+        </div>
+        
+        <div className="mb-4 text-center h-20">
+          {digitToDraw !== null ? (
+            <p className="text-2xl font-bold p-2 bg-gray-800 inline-block rounded">
+              Please Draw: <span className="text-green-500">{digitToDraw}</span>
+            </p>
+          ) : (
+            webcamRunning ? (
+              <button 
+                onClick={fetchNextDigitPrompt} 
+                className="bg-blue-500 hover:bg-blue-600 text-white px-4 py-2 rounded"
+              >
+                Get Next Digit
+              </button>
+            ) : (
+              <p className="text-lg text-gray-400 p-2">
+                Enable webcam to start.
+              </p>
+            )
+          )}
+        </div>
+        
+        {loading ? (
+          <p className="text-center">Loading hand tracking model...</p>
+        ) : (
+          <div className="relative">
             <video 
               ref={videoRef}
               autoPlay 
               playsInline
+              className="w-full h-auto block"
               style={{ 
                 transform: 'scaleX(-1)', // Mirror horizontally
-                width: '100%',
-                maxWidth: '640px',
-                height: 'auto',
                 display: webcamRunning ? 'block' : 'none'
               }}
             />
             <canvas
               ref={canvasRef}
+              className="absolute top-0 left-0 w-full h-full block"
               style={{
-                position: 'absolute',
-                left: 0,
-                top: 0,
                 transform: 'scaleX(-1)', // Mirror to match video
-                width: '100%',
-                maxWidth: '640px',
-                height: 'auto',
                 display: webcamRunning ? 'block' : 'none'
               }}
             />
-            
+          </div>
+        )}
+        
+        <div className="flex justify-between mt-4">
+          {!webcamRunning ? (
             <button 
-              onClick={handleStartDrawing} 
-              disabled={!webcamRunning || isRecording || loading || digitToDraw === null} 
-              style={{
-                position: 'absolute', 
-                bottom: '50px', 
-                left: '10px', 
-                zIndex: 10, 
-                padding: '10px', 
-                backgroundColor: (!webcamRunning || digitToDraw === null) ? 'grey' : (isRecording ? 'grey' : 'lightgreen'),
-                color: 'black',
-                fontSize: '14px',
-                border: '2px solid black'
-              }}
+              onClick={enableCam} 
+              disabled={!handLandmarker}
+              className="bg-yellow-400 text-black font-medium px-4 py-2 rounded disabled:opacity-50"
             >
-              Start Drawing
+              Enable Webcam
             </button>
-            
+          ) : (
             <button 
-              onClick={handleStopDrawing} 
-              disabled={!webcamRunning || !isRecording || loading} 
-              style={{
-                position: 'absolute', 
-                bottom: '50px', 
-                left: '150px', 
-                zIndex: 10, 
-                padding: '10px', 
-                backgroundColor: !isRecording ? 'grey' : 'orange',
-                color: 'black',
-                fontSize: '14px',
-                border: '2px solid black'
-              }}
+              onClick={disableCam}
+              className="bg-yellow-400 text-black font-medium px-4 py-2 rounded"
             >
-              Stop Drawing
+              Disable Webcam
             </button>
-          </div>
+          )}
+        </div>
+
+        <div className="mt-4 text-center h-16">
+          {predictedDigit !== null && (
+            <h2 className="text-2xl font-bold text-blue-400 bg-gray-800 inline-block p-2 rounded">
+              Detected: {String(predictedDigit)}
+              {predictionConfidence !== null && ` (${(predictionConfidence * 100).toFixed(1)}%)`}
+            </h2>
+          )}
+        </div>
+      </div>
+      
+      {/* Right column - Controls */}
+      <div className="w-full md:w-1/2 lg:w-2/5 bg-gray-800 p-4 rounded-lg shadow-lg">
+        <h3 className="text-xl mb-4 border-b border-gray-700 pb-2">Controls</h3>
+        
+        <div className="flex flex-col gap-3">
+          <button 
+            onClick={handleStartDrawing} 
+            disabled={!webcamRunning || isRecording || loading || digitToDraw === null} 
+            className="bg-green-500 hover:bg-green-600 text-white px-4 py-2 rounded disabled:opacity-50 disabled:cursor-not-allowed"
+          >
+            Start Drawing
+          </button>
           
-          <div className="controls">
-            {!webcamRunning ? (
-              <button 
-                onClick={enableCam} 
-                disabled={!handLandmarker}
-                style={{ 
-                  border: '3px solid lime', 
-                  backgroundColor: 'yellow', 
-                  color: 'black', 
-                  fontSize: '16px',
-                  padding: '8px 16px',
-                  margin: '10px 0'
-                }}
-              >
-                Enable Webcam
-              </button>
-            ) : (
-              <button 
-                onClick={disableCam}
-                style={{ 
-                  border: '3px solid lime', 
-                  backgroundColor: 'yellow', 
-                  color: 'black', 
-                  fontSize: '16px',
-                  padding: '8px 16px',
-                  margin: '10px 0'
-                }}
-              >
-                Disable Webcam
-              </button>
-            )}
-          </div>
+          <button 
+            onClick={handleStopDrawing} 
+            disabled={!webcamRunning || !isRecording || loading} 
+            className="bg-orange-500 hover:bg-orange-600 text-white px-4 py-2 rounded disabled:opacity-50 disabled:cursor-not-allowed"
+          >
+            Stop Drawing
+          </button>
           
-          <div style={{ marginTop: '20px', textAlign: 'center', height: '60px', padding: '10px' }}>
-            {predictedDigit !== null && (
-              <h2 style={{ 
-                fontSize: '2.5em', 
-                fontWeight: 'bold', 
-                color: '#0066cc',
-                background: 'rgba(255, 255, 255, 0.8)',
-                padding: '5px 15px',
-                borderRadius: '8px',
-                display: 'inline-block'
-              }}>
-                Detected: {String(predictedDigit)}
-                {predictionConfidence !== null && ` (${(predictionConfidence * 100).toFixed(1)}%)`}
-              </h2>
-            )}
-          </div>
-        </>
-      )}
+          <button 
+            onClick={handleResetDrawing} 
+            disabled={currentPath.length === 0 || loading} 
+            className="bg-red-500 hover:bg-red-600 text-white px-4 py-2 rounded disabled:opacity-50 disabled:cursor-not-allowed"
+          >
+            Reset Drawing
+          </button>
+        </div>
+      </div>
     </div>
   );
 };
