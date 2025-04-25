@@ -12,7 +12,12 @@ const PROCESS_NOISE_Q = 0.01; // Process noise - how much we expect the motion m
 const MEASUREMENT_NOISE_R = 0.1; // Measurement noise - how much we expect the measurements to be noisy (higher = trust measurements less)
 const INITIAL_COVARIANCE_P = 1.0; // Initial state covariance - higher means less trust in initial state
 const DT = 1/30; // Time delta between frames in seconds - 30 FPS assumption
-const VELOCITY_STOP_THRESHOLD = 0.000001; // Velocity threshold for auto-stopping recording (needs tuning)
+const VELOCITY_STOP_THRESHOLD = 0.035; // Velocity threshold for auto-stopping recording (needs tuning)
+
+// Path trimming constants
+const TRIM_MIN_PATH_LENGTH = 10; // Min points needed to attempt trimming
+const TRIM_WINDOW_SIZE = 5;      // How many points to average over
+const TRIM_DISTANCE_DROP_MULTIPLIER = 0.3; // Lower values = more aggressive trimming
 
 /**
  * 2D Kalman Filter for smoothing finger tip trajectories
@@ -294,6 +299,73 @@ function matrixInverse2x2(m: number[][]): number[][] {
     [-m[1][0] * invDet, m[0][0] * invDet]
   ];
 }
+
+/**
+ * Calculate average of an array of numbers
+ */
+const average = (arr: number[]): number => {
+  if (arr.length === 0) return 0;
+  return arr.reduce((sum, val) => sum + val, 0) / arr.length;
+};
+
+/**
+ * Trim noisy tail segments from the drawing path based on distance drop heuristic
+ * @param path The recorded path of points
+ * @returns Trimmed path with noisy tail removed
+ */
+const trimNoisyTail = (path: Point[]): Point[] => {
+  // If path is too short, return as is
+  if (path.length < TRIM_MIN_PATH_LENGTH) {
+    console.log("Path too short for trimming:", path.length);
+    return path;
+  }
+
+  // Calculate point-to-point distances
+  const distances: number[] = [];
+  for (let i = 1; i < path.length; i++) {
+    const dist = Math.sqrt(
+      Math.pow(path[i].x - path[i - 1].x, 2) + 
+      Math.pow(path[i].y - path[i - 1].y, 2)
+    );
+    distances.push(dist);
+  }
+
+  // Log initial distance stats
+  console.log("Distance stats - Min:", Math.min(...distances), "Max:", Math.max(...distances), "Avg:", average(distances));
+
+  // Analyze distances from back to front to find significant drop
+  let cutoffIndex = -1;
+  for (let i = path.length - 2; i >= TRIM_WINDOW_SIZE; i--) {
+    // Calculate average distance in window before current point
+    const beforeWindow = distances.slice(i - TRIM_WINDOW_SIZE + 1, i + 1);
+    const avgDistBefore = average(beforeWindow);
+
+    // Calculate average distance after current point to end
+    const afterWindow = distances.slice(i + 1);
+    const avgDistAfter = average(afterWindow);
+
+    // Debug logging for tuning
+    if (i % 5 === 0) { // Log every 5th check to avoid excessive output
+      console.log(`Point ${i}: Before avg=${avgDistBefore.toFixed(6)}, After avg=${avgDistAfter.toFixed(6)}, Ratio=${(avgDistAfter/avgDistBefore).toFixed(6)}`);
+    }
+
+    // Check for significant drop
+    if (avgDistAfter < avgDistBefore * TRIM_DISTANCE_DROP_MULTIPLIER) {
+      cutoffIndex = i;
+      console.log(`Trim point found at index ${i}: Before avg=${avgDistBefore.toFixed(6)}, After avg=${avgDistAfter.toFixed(6)}, Ratio=${(avgDistAfter/avgDistBefore).toFixed(6)}`);
+      break;
+    }
+  }
+
+  // Return the trimmed path if a cutoff was found, otherwise return the original
+  if (cutoffIndex > 0) {
+    return path.slice(0, cutoffIndex + 1);
+  }
+  
+  // Fallback: if no clear drop, return original path (or optionally trim last 1-2 points)
+  console.log("No clear distance drop found - returning full path");
+  return path;
+};
 
 /**
  * Legacy moving average smoothing - kept for reference or fallback
@@ -593,7 +665,7 @@ const HandTracker: React.FC = () => {
 
   // --- Webcam Handling & Prediction Loop ---
   const predictWebcam = useCallback(() => {
-    console.log('predictWebcam called...');
+    // console.log('predictWebcam called...'); // Commented out - reduces noise
     
     if (!handLandmarker || !webcamRunning || !videoRef.current || videoRef.current.readyState < 2) {
       return;
@@ -603,7 +675,7 @@ const HandTracker: React.FC = () => {
     const startTimeMs = performance.now();
     const detectionResults = handLandmarker.detectForVideo(video, startTimeMs);
     setLatestResults(detectionResults); // Update state instead of ref
-    console.log('Detection Results:', detectionResults);
+    // console.log('Detection Results:', detectionResults); // Commented out - reduces noise
 
   }, [handLandmarker, webcamRunning]); // Dependencies for the callback
 
@@ -638,7 +710,7 @@ const HandTracker: React.FC = () => {
             canvasCtx.clearRect(0, 0, canvasRef.current.width, canvasRef.current.height);
             // Draw based on the LATEST results stored in state
             if (latestResults && latestResults.landmarks && latestResults.landmarks.length > 0) {
-                console.log('Drawing landmarks for', latestResults.landmarks.length, 'hands');
+                // console.log('Drawing landmarks for', latestResults.landmarks.length, 'hands'); // Commented out - reduces noise
                 for (const landmarks of latestResults.landmarks) {
                     drawLandmarks(canvasCtx, landmarks);
                 }
@@ -680,10 +752,14 @@ const HandTracker: React.FC = () => {
                         if (kalmanFilterRef.current) {
                             const currentSpeed = kalmanFilterRef.current.getSpeed();
                             
+                            // Enable speed logging for tuning auto-stop threshold
+                            console.log("Current Speed:", currentSpeed.toFixed(4));
+                            
                             // Auto-stop if speed is below threshold and we've been recording for at least 1 second
                             // to prevent premature stopping at the beginning of drawing
                             if (currentSpeed < VELOCITY_STOP_THRESHOLD && currentPath.length > 30) {
                                 console.log(`Auto-stopping: Speed ${currentSpeed.toFixed(6)} < Threshold ${VELOCITY_STOP_THRESHOLD}`);
+                                // Call handleStopDrawing which includes path trimming via trimNoisyTail
                                 handleStopDrawing();
                             }
                         }
@@ -751,17 +827,22 @@ const HandTracker: React.FC = () => {
     setIsRecording(false);
 
     const rawPath = [...currentPath];
+    
+    // Apply path trimming to remove noisy tail segments
+    const trimmedPath = trimNoisyTail(rawPath);
+    console.log(`Path trimming: Original=${rawPath.length}, Trimmed=${trimmedPath.length}`);
+    
     // We're now using Kalman filter for real-time smoothing, so we don't need the
     // post-processing moving average filter anymore. The path is already filtered.
     // const smoothingWindowSize = 3;
     // const smoothedPath = smoothPath(rawPath, smoothingWindowSize);
     
-    // Use the Kalman-filtered path directly
-    const filteredPath = rawPath;
+    // Use the Kalman-filtered and trimmed path
+    const filteredPath = trimmedPath;
 
     console.log("Path Recorded (Points):", rawPath.length, rawPath);
     // console.log(`Smoothed Path (Window ${smoothingWindowSize}, Points):`, smoothedPath.length, smoothedPath);
-    console.log("Kalman Filtered Path (Points):", filteredPath.length);
+    console.log("Kalman Filtered & Trimmed Path (Points):", filteredPath.length);
 
     if (filteredPath.length > 1) {
         // Immediately submit the path with the prompted label
@@ -843,7 +924,7 @@ const HandTracker: React.FC = () => {
       }
   };
 
-  console.log("HandTracker Component Render - Loading state:", loading);
+  // console.log("HandTracker Component Render - Loading state:", loading); // Commented out - reduces noise
 
   return (
     <div className="flex flex-col md:flex-row gap-4 p-4 bg-gray-900 text-gray-200 min-h-screen">
