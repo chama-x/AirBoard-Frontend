@@ -5,6 +5,7 @@ import { HandLandmarker, FilesetResolver, HandLandmarkerResult, NormalizedLandma
 // For now, let's use the basic drawing function defined inside.
 
 interface Point { x: number; y: number; z?: number; } // Define a Point type
+type WsStatus = 'disconnected' | 'connecting' | 'connected' | 'error';
 
 /**
  * Applies a moving average smoothing to a path of points
@@ -57,6 +58,12 @@ const HandTracker: React.FC = () => {
   const [latestResults, setLatestResults] = useState<HandLandmarkerResult | null>(null);
   const [isRecording, setIsRecording] = useState<boolean>(false);
   const [currentPath, setCurrentPath] = useState<Point[]>([]);
+  const [needsLabel, setNeedsLabel] = useState<boolean>(false);
+  const [lastPath, setLastPath] = useState<Point[] | null>(null); // Store path temporarily until labeled
+  const [ws, setWs] = useState<WebSocket | null>(null);
+  const [wsStatus, setWsStatus] = useState<WsStatus>('disconnected');
+  const [predictedDigit, setPredictedDigit] = useState<number | string | null>(null);
+  const [predictionConfidence, setPredictionConfidence] = useState<number | null>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const requestRef = useRef<number | null>(null); // For requestAnimationFrame handle
@@ -87,6 +94,70 @@ const HandTracker: React.FC = () => {
       // Add drawing connectors if needed (e.g., using HandLandmarker.HAND_CONNECTIONS)
   };
 
+  // --- WebSocket Connection Management ---
+  useEffect(() => {
+    console.log("Attempting WebSocket connection...");
+    setWsStatus('connecting');
+    // Replace localhost with your machine's actual IP if testing on different devices,
+    // but localhost should work if backend server is running on the same machine.
+    const websocketUrl = 'ws://localhost:8000/ws';
+    const socket = new WebSocket(websocketUrl);
+
+    socket.onopen = () => {
+      console.log('WebSocket connection established.');
+      setWsStatus('connected');
+      setWs(socket); // Store the connected socket object in state
+    };
+
+    socket.onmessage = (event) => {
+      console.log('WebSocket message received:', event.data);
+      try {
+        const result = JSON.parse(event.data);
+        if (result && result.prediction !== undefined) {
+           // Successfully received prediction
+           setPredictedDigit(result.prediction);
+           setPredictionConfidence(result.confidence !== undefined ? result.confidence : null);
+        } else if (result && result.error) {
+           // Handle potential errors sent from backend
+           console.error("Backend error received:", result.error);
+           setPredictedDigit(`Error: ${result.error}`);
+           setPredictionConfidence(null);
+        } else {
+           // Unexpected message format
+           console.warn("Received unexpected message format:", result);
+           setPredictedDigit("?");
+           setPredictionConfidence(null);
+        }
+      } catch (error) {
+         console.error('Error parsing WebSocket message or invalid format:', error);
+         // Display raw data if parsing fails but data exists
+         setPredictedDigit(event.data ? `Data: ${event.data.substring(0, 30)}...` : "?");
+         setPredictionConfidence(null);
+      }
+    };
+
+    socket.onerror = (error) => {
+      console.error('WebSocket error:', error);
+      setWsStatus('error');
+      setWs(null);
+    };
+
+    socket.onclose = (event) => {
+      console.log('WebSocket connection closed:', event.code, event.reason);
+      setWsStatus('disconnected');
+      setWs(null);
+    };
+
+    // Cleanup function: close the WebSocket connection when the component unmounts
+    return () => {
+      if (socket.readyState === WebSocket.OPEN) {
+        console.log('Closing WebSocket connection.');
+        socket.close();
+      }
+      setWs(null);
+      setWsStatus('disconnected');
+    };
+  }, []); // Empty dependency array ensures this runs only once on mount/unmount
 
   // --- Initialize HandLandmarker ---
   useEffect(() => {
@@ -227,9 +298,13 @@ const HandTracker: React.FC = () => {
 
   // --- Drawing Controls ---
   const handleStartDrawing = () => {
-    if (!webcamRunning) return; // Only start if webcam is on
+    if (!webcamRunning) return;
     console.log("Starting path recording...");
-    setCurrentPath([]); // Clear previous path
+    setCurrentPath([]);
+    setLastPath(null); // Clear stored path
+    setNeedsLabel(false); // Disable labeling UI
+    setPredictedDigit(null); // Clear previous prediction
+    setPredictionConfidence(null);
     setIsRecording(true);
   };
 
@@ -238,20 +313,44 @@ const HandTracker: React.FC = () => {
     console.log("Stopping path recording...");
     setIsRecording(false);
 
-    const rawPath = [...currentPath]; // Create a copy before clearing state
-
-    // Smooth the path (use a small window like 3 or 5)
+    const rawPath = [...currentPath];
     const smoothingWindowSize = 3;
     const smoothedPath = smoothPath(rawPath, smoothingWindowSize);
 
-    // Log both paths for comparison
     console.log("Raw Path Recorded (Points):", rawPath.length, rawPath);
     console.log(`Smoothed Path (Window ${smoothingWindowSize}, Points):`, smoothedPath.length, smoothedPath);
 
-    // Clear the path for the next drawing
-    setCurrentPath([]);
+    if (smoothedPath.length > 1) { // Only enable labeling if path has data
+        setLastPath(smoothedPath); // Store the path to be labeled
+        setNeedsLabel(true);      // Enable labeling UI
+    } else {
+        console.log("Path too short, skipping labeling.");
+        setCurrentPath([]); // Clear path if too short
+    }
+    // Don't clear currentPath here yet, maybe visualize the final smoothed path briefly?
+  };
 
-    // Later: Send the 'smoothedPath' to the backend instead of rawPath
+  const submitLabeledPath = (label: number) => {
+    if (!lastPath || !ws || ws.readyState !== WebSocket.OPEN) {
+         console.warn("Cannot submit label - no path stored or WebSocket not connected.");
+         setNeedsLabel(false); // Hide labeling buttons even if submission fails
+         setCurrentPath([]); // Clear visual path
+         setLastPath(null);
+         return;
+    }
+    console.log(`Submitting path as label: ${label}`);
+    try {
+        const dataToSend = JSON.stringify({ path: lastPath, label: label }); // NEW FORMAT
+        ws.send(dataToSend);
+        console.log("Labeled path sent via WebSocket.");
+    } catch (error) {
+        console.error("Error sending labeled path via WebSocket:", error);
+    } finally {
+        // Reset state after submission attempt
+        setNeedsLabel(false);
+        setCurrentPath([]); // Clear visual path
+        setLastPath(null);
+    }
   };
 
   // --- Enable/Disable Webcam ---
@@ -295,6 +394,22 @@ const HandTracker: React.FC = () => {
   return (
     <div className="hand-tracker-container">
       <h2>Hand Tracking with MediaPipe</h2>
+      <div className="connection-status" style={{ 
+        marginBottom: '10px',
+        padding: '5px',
+        backgroundColor: 
+          wsStatus === 'connected' ? '#dff0d8' : 
+          wsStatus === 'connecting' ? '#fcf8e3' : 
+          wsStatus === 'error' ? '#f2dede' : '#f8f9fa',
+        color: 
+          wsStatus === 'connected' ? '#3c763d' : 
+          wsStatus === 'connecting' ? '#8a6d3b' : 
+          wsStatus === 'error' ? '#a94442' : '#6c757d',
+        borderRadius: '4px',
+        fontSize: '14px'
+      }}>
+        WebSocket: {wsStatus}
+      </div>
       
       {loading ? (
         <p>Loading hand tracking model...</p>
@@ -396,6 +511,53 @@ const HandTracker: React.FC = () => {
               </button>
             )}
           </div>
+          
+          <div style={{ marginTop: '20px', textAlign: 'center', height: '60px', padding: '10px' }}>
+            {predictedDigit !== null && (
+              <h2 style={{ 
+                fontSize: '2.5em', 
+                fontWeight: 'bold', 
+                color: '#0066cc',
+                background: 'rgba(255, 255, 255, 0.8)',
+                padding: '5px 15px',
+                borderRadius: '8px',
+                display: 'inline-block'
+              }}>
+                Detected: {String(predictedDigit)}
+                {predictionConfidence !== null && ` (${(predictionConfidence * 100).toFixed(1)}%)`}
+              </h2>
+            )}
+          </div>
+          
+          {needsLabel && (
+            <div style={{ marginTop: '15px', textAlign: 'center' }}>
+              <h3 style={{ color: '#333', marginBottom: '10px', backgroundColor: 'rgba(255, 255, 255, 0.8)', padding: '5px', borderRadius: '4px', display: 'inline-block' }}>
+                What digit did you draw?
+              </h3>
+              <div>
+                {[0, 1, 2, 3, 4, 5, 6, 7, 8, 9].map((digit) => (
+                  <button
+                    key={digit}
+                    onClick={() => submitLabeledPath(digit)}
+                    style={{ 
+                      padding: '10px 15px', 
+                      margin: '4px', 
+                      fontSize: '18px', 
+                      minWidth: '50px',
+                      backgroundColor: '#4CAF50',
+                      color: 'white',
+                      border: 'none',
+                      borderRadius: '4px',
+                      cursor: 'pointer',
+                      boxShadow: '0 2px 5px rgba(0,0,0,0.2)'
+                    }}
+                  >
+                    {digit}
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
         </>
       )}
     </div>
