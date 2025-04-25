@@ -9,15 +9,17 @@ type WsStatus = 'disconnected' | 'connecting' | 'connected' | 'error';
 
 // Kalman Filter Parameters - Tunable constants
 const PROCESS_NOISE_Q = 0.01; // Process noise - how much we expect the motion model to be incorrect (smaller = smoother but more laggy)
-const MEASUREMENT_NOISE_R = 0.1; // Measurement noise - how much we expect the measurements to be noisy (higher = trust measurements less)
+const MEASUREMENT_NOISE_R = 0.2; // Measurement noise - how much we expect the measurements to be noisy (higher = trust measurements less)
 const INITIAL_COVARIANCE_P = 1.0; // Initial state covariance - higher means less trust in initial state
 const DT = 1/30; // Time delta between frames in seconds - 30 FPS assumption
-const VELOCITY_STOP_THRESHOLD = 0.035; // Velocity threshold for auto-stopping recording (needs tuning)
+const VELOCITY_STOP_THRESHOLD = 0.08; // Velocity threshold for auto-stopping recording (needs tuning)
+const STOP_DURATION_MS = 300; // ms - Time speed must be below threshold to stop (needs tuning)
+const MIN_PATH_LENGTH_FOR_AUTOSTOP = 30; // Minimum number of points needed before auto-stop can activate
 
 // Path trimming constants
-const TRIM_MIN_PATH_LENGTH = 10; // Min points needed to attempt trimming
-const TRIM_WINDOW_SIZE = 5;      // How many points to average over
-const TRIM_DISTANCE_DROP_MULTIPLIER = 0.3; // Lower values = more aggressive trimming
+const TRIM_MIN_PATH_LENGTH = 5; // Min points needed to attempt trimming
+const TRIM_WINDOW_SIZE = 4;      // How many points to average over
+const TRIM_VARIANCE_THRESHOLD = 0.0001; // Threshold for variance detection (needs tuning)
 
 /**
  * 2D Kalman Filter for smoothing finger tip trajectories
@@ -301,15 +303,7 @@ function matrixInverse2x2(m: number[][]): number[][] {
 }
 
 /**
- * Calculate average of an array of numbers
- */
-const average = (arr: number[]): number => {
-  if (arr.length === 0) return 0;
-  return arr.reduce((sum, val) => sum + val, 0) / arr.length;
-};
-
-/**
- * Trim noisy tail segments from the drawing path based on distance drop heuristic
+ * Trim noisy tail segments from the drawing path based on positional variance
  * @param path The recorded path of points
  * @returns Trimmed path with noisy tail removed
  */
@@ -320,50 +314,70 @@ const trimNoisyTail = (path: Point[]): Point[] => {
     return path;
   }
 
-  // Calculate point-to-point distances
-  const distances: number[] = [];
-  for (let i = 1; i < path.length; i++) {
-    const dist = Math.sqrt(
-      Math.pow(path[i].x - path[i - 1].x, 2) + 
-      Math.pow(path[i].y - path[i - 1].y, 2)
-    );
-    distances.push(dist);
-  }
+  // Helper function to calculate variance for a set of points along a dimension
+  const calculateVariance = (points: Point[], dimension: 'x' | 'y'): number => {
+    if (points.length < 2) return 0;
+    
+    // Extract the specified dimension values
+    const values = points.map(p => p[dimension]);
+    
+    // Calculate mean
+    const mean = values.reduce((sum, val) => sum + val, 0) / values.length;
+    
+    // Calculate variance (average of squared differences from mean)
+    const squaredDifferences = values.map(val => Math.pow(val - mean, 2));
+    const variance = squaredDifferences.reduce((sum, val) => sum + val, 0) / values.length;
+    
+    return variance;
+  };
 
-  // Log initial distance stats
-  console.log("Distance stats - Min:", Math.min(...distances), "Max:", Math.max(...distances), "Avg:", average(distances));
-
-  // Analyze distances from back to front to find significant drop
+  // Find the point where variance transitions from low (jittery tail) to high (intentional stroke)
   let cutoffIndex = -1;
-  for (let i = path.length - 2; i >= TRIM_WINDOW_SIZE; i--) {
-    // Calculate average distance in window before current point
-    const beforeWindow = distances.slice(i - TRIM_WINDOW_SIZE + 1, i + 1);
-    const avgDistBefore = average(beforeWindow);
-
-    // Calculate average distance after current point to end
-    const afterWindow = distances.slice(i + 1);
-    const avgDistAfter = average(afterWindow);
-
-    // Debug logging for tuning
-    if (i % 5 === 0) { // Log every 5th check to avoid excessive output
-      console.log(`Point ${i}: Before avg=${avgDistBefore.toFixed(6)}, After avg=${avgDistAfter.toFixed(6)}, Ratio=${(avgDistAfter/avgDistBefore).toFixed(6)}`);
+  
+  console.log("Starting variance-based tail trimming analysis...");
+  
+  // Iterate backward from the end to find where variance increases
+  for (let i = path.length - 1; i >= TRIM_WINDOW_SIZE; i--) {
+    // Get current window of points
+    const currentWindow = path.slice(i - TRIM_WINDOW_SIZE + 1, i + 1);
+    
+    // Calculate variance in both dimensions
+    const varianceX = calculateVariance(currentWindow, 'x');
+    const varianceY = calculateVariance(currentWindow, 'y');
+    
+    // Combined variance measure
+    const totalVariance = varianceX + varianceY;
+    
+    // Log every few iterations to avoid flooding console
+    if ((path.length - i) % 5 === 0) {
+      console.log(`Window at index ${i}: varianceX=${varianceX.toExponential(4)}, varianceY=${varianceY.toExponential(4)}, total=${totalVariance.toExponential(4)}`);
     }
-
-    // Check for significant drop
-    if (avgDistAfter < avgDistBefore * TRIM_DISTANCE_DROP_MULTIPLIER) {
+    
+    // When we find a window with variance above threshold, we've found the transition point
+    // This means we're moving from the jittery tail (low variance) to the main stroke (higher variance)
+    if (totalVariance >= TRIM_VARIANCE_THRESHOLD) {
       cutoffIndex = i;
-      console.log(`Trim point found at index ${i}: Before avg=${avgDistBefore.toFixed(6)}, After avg=${avgDistAfter.toFixed(6)}, Ratio=${(avgDistAfter/avgDistBefore).toFixed(6)}`);
+      console.log(`Transition point found at index ${i}: totalVariance=${totalVariance.toExponential(4)}, threshold=${TRIM_VARIANCE_THRESHOLD.toExponential(4)}`);
       break;
     }
   }
 
   // Return the trimmed path if a cutoff was found, otherwise return the original
   if (cutoffIndex > 0) {
+    // Keep up to the cutoff index (inclusive)
+    console.log(`Trimming path from ${path.length} to ${cutoffIndex + 1} points`);
     return path.slice(0, cutoffIndex + 1);
   }
   
-  // Fallback: if no clear drop, return original path (or optionally trim last 1-2 points)
-  console.log("No clear distance drop found - returning full path");
+  // Fallback: if all windows had low variance, return a minimal subset of the path
+  // This can happen if the entire end of the path is just random jitter
+  if (path.length > TRIM_MIN_PATH_LENGTH * 2) {
+    const fallbackLength = Math.max(path.length - TRIM_WINDOW_SIZE, TRIM_MIN_PATH_LENGTH);
+    console.log(`No clear variance transition found - returning first ${fallbackLength} points`);
+    return path.slice(0, fallbackLength);
+  }
+  
+  console.log("No variance transition found and path is short - returning full path");
   return path;
 };
 
@@ -430,6 +444,7 @@ const HandTracker: React.FC = () => {
   const requestRef = useRef<number | null>(null); // For requestAnimationFrame handle
   const kalmanFilterRef = useRef<KalmanFilter2D | null>(null); // Kalman filter instance
   const lastFrameTimeRef = useRef<number>(0); // Track last frame time for dt calculation
+  const timeBelowThresholdStartRef = useRef<number | null>(null); // Track when speed drops below threshold
 
   // --- Basic Drawing Utility ---
   const drawLandmarks = (ctx: CanvasRenderingContext2D, landmarks: NormalizedLandmark[]) => {
@@ -662,169 +677,36 @@ const HandTracker: React.FC = () => {
     // Check MediaPipe docs for recommended cleanup if needed.
   }, []);
 
-
-  // --- Webcam Handling & Prediction Loop ---
-  const predictWebcam = useCallback(() => {
-    // console.log('predictWebcam called...'); // Commented out - reduces noise
-    
-    if (!handLandmarker || !webcamRunning || !videoRef.current || videoRef.current.readyState < 2) {
-      return;
-    }
-
-    const video = videoRef.current;
-    const startTimeMs = performance.now();
-    const detectionResults = handLandmarker.detectForVideo(video, startTimeMs);
-    setLatestResults(detectionResults); // Update state instead of ref
-    // console.log('Detection Results:', detectionResults); // Commented out - reduces noise
-
-  }, [handLandmarker, webcamRunning]); // Dependencies for the callback
-
-
-  // --- Effect to Start/Stop Loop ---
-   useEffect(() => {
-    let animationFrameId: number | null = null;
-
-    const renderLoop = () => {
-        if (!webcamRunning || !handLandmarker) { // Stop loop if conditions unmet
-             if (animationFrameId) cancelAnimationFrame(animationFrameId);
-             return;
-        }
-
-        const currentTime = performance.now();
-        
-        // Call predictWebcam to get results for the *next* frame and update state
-        predictWebcam();
-
-        // --- Drawing ---
-        const canvasCtx = canvasRef.current?.getContext("2d");
-        if (canvasCtx && canvasRef.current) {
-            // Match canvas size to video
-            if (canvasRef.current.width !== videoRef.current?.videoWidth) {
-                 canvasRef.current.width = videoRef.current?.videoWidth || 640;
-            }
-            if (canvasRef.current.height !== videoRef.current?.videoHeight) {
-                 canvasRef.current.height = videoRef.current?.videoHeight || 480;
-            }
-
-            canvasCtx.save();
-            canvasCtx.clearRect(0, 0, canvasRef.current.width, canvasRef.current.height);
-            // Draw based on the LATEST results stored in state
-            if (latestResults && latestResults.landmarks && latestResults.landmarks.length > 0) {
-                // console.log('Drawing landmarks for', latestResults.landmarks.length, 'hands'); // Commented out - reduces noise
-                for (const landmarks of latestResults.landmarks) {
-                    drawLandmarks(canvasCtx, landmarks);
-                }
-                
-                // Record path if recording is active
-                if (isRecording) {
-                    const landmarks = latestResults.landmarks[0]; // Assuming one hand
-                    if (landmarks && landmarks[8]) { // Check if index finger tip exists
-                        const rawFingerTip = {
-                            x: landmarks[8].x,
-                            y: landmarks[8].y,
-                            z: landmarks[8].z // Include z if available/needed
-                        };
-                        
-                        // Apply Kalman filtering
-                        if (!kalmanFilterRef.current) {
-                            // First detection, initialize the filter
-                            kalmanFilterRef.current = new KalmanFilter2D(rawFingerTip.x, rawFingerTip.y);
-                        }
-                        
-                        // Process through Kalman filter with timestamp
-                        const [filteredX, filteredY] = kalmanFilterRef.current.process(
-                            rawFingerTip.x, 
-                            rawFingerTip.y,
-                            currentTime
-                        );
-                        
-                        // Create filtered point with the same z-value
-                        const filteredFingerTip: Point = {
-                            x: filteredX,
-                            y: filteredY,
-                            z: rawFingerTip.z
-                        };
-                        
-                        // Use functional update for state arrays for better performance
-                        setCurrentPath(prevPath => [...prevPath, filteredFingerTip]);
-                        
-                        // Check velocity for auto-stopping drawing
-                        if (kalmanFilterRef.current) {
-                            const currentSpeed = kalmanFilterRef.current.getSpeed();
-                            
-                            // Enable speed logging for tuning auto-stop threshold
-                            console.log("Current Speed:", currentSpeed.toFixed(4));
-                            
-                            // Auto-stop if speed is below threshold and we've been recording for at least 1 second
-                            // to prevent premature stopping at the beginning of drawing
-                            if (currentSpeed < VELOCITY_STOP_THRESHOLD && currentPath.length > 30) {
-                                console.log(`Auto-stopping: Speed ${currentSpeed.toFixed(6)} < Threshold ${VELOCITY_STOP_THRESHOLD}`);
-                                // Call handleStopDrawing which includes path trimming via trimNoisyTail
-                                handleStopDrawing();
-                            }
-                        }
-                    }
-                }
-            }
-            
-            // Draw the recorded path
-            if (currentPath.length > 1) {
-                canvasCtx.strokeStyle = "#FFFFFF"; // White path
-                canvasCtx.lineWidth = 3;
-                canvasCtx.beginPath();
-                canvasCtx.moveTo(currentPath[0].x * canvasRef.current.width, currentPath[0].y * canvasRef.current.height);
-                for (let i = 1; i < currentPath.length; i++) {
-                    canvasCtx.lineTo(currentPath[i].x * canvasRef.current.width, currentPath[i].y * canvasRef.current.height);
-                }
-                canvasCtx.stroke();
-            }
-            
-            canvasCtx.restore();
-        }
-        
-        lastFrameTimeRef.current = currentTime;
-        
-        // Schedule next frame
-        animationFrameId = requestAnimationFrame(renderLoop);
-    };
-
-    if (webcamRunning && handLandmarker) {
-        animationFrameId = requestAnimationFrame(renderLoop); // Start loop
-    } else {
-        if (animationFrameId) cancelAnimationFrame(animationFrameId); // Clear if stopped
-        // Clear canvas
-        const canvasCtx = canvasRef.current?.getContext("2d");
-        if (canvasCtx && canvasRef.current) {
-            canvasCtx.clearRect(0, 0, canvasRef.current.width, canvasRef.current.height);
-        }
-    }
-
-    // Cleanup animation frame on component unmount or when dependencies change
-    return () => {
-      if (animationFrameId) {
-        cancelAnimationFrame(animationFrameId);
-      }
-    };
-  }, [webcamRunning, handLandmarker, predictWebcam, latestResults, videoRef, isRecording, currentPath]); // Dependencies
-
-
   // --- Drawing Controls ---
-  const handleStartDrawing = () => {
-    if (!webcamRunning || digitToDraw === null) return; // Don't start if no prompt
-    console.log(`Starting path recording for digit: ${digitToDraw}...`);
-    setCurrentPath([]); // Clear previous visual path
-    setPredictedDigit(null);
-    setPredictionConfidence(null);
-    setIsRecording(true);
-    
-    // Reset Kalman filter for new drawing
-    kalmanFilterRef.current = null;
-  };
+  const submitDrawing = useCallback((pathToSend: Point[]) => { // Takes path as argument
+    if (digitToDraw === null || !pathToSend || !ws || ws.readyState !== WebSocket.OPEN) {
+         console.warn("Cannot submit drawing - no prompted digit, path missing, or WebSocket not connected.");
+         // Reset state partially?
+         setCurrentPath([]);
+         setDigitToDraw(null); // Force fetch next
+         return;
+    }
+    console.log(`Submitting path for prompted label: ${digitToDraw}`);
+    try {
+        const dataToSend = JSON.stringify({ path: pathToSend, label: digitToDraw }); // Use digitToDraw state
+        ws.send(dataToSend);
+        console.log("Drawing path sent via WebSocket.");
+    } catch (error) {
+        console.error("Error sending drawing path via WebSocket:", error);
+    } finally {
+        // Reset state after submission attempt
+        setCurrentPath([]); // Clear visual path
+        setDigitToDraw(null); // Clear prompt, require user action for next one
+        // Prediction state (setPredictedDigit) will be updated by onmessage handler
+    }
+  }, [digitToDraw, ws, setCurrentPath, setDigitToDraw]);
 
-  const handleStopDrawing = () => {
+  const handleStopDrawing = useCallback(() => {
     if (!isRecording || digitToDraw === null) return; // Check digitToDraw too
     console.log(`Stopping path recording for digit: ${digitToDraw}...`);
     setIsRecording(false);
+    // Reset threshold timer
+    timeBelowThresholdStartRef.current = null;
 
     const rawPath = [...currentPath];
     
@@ -855,38 +737,186 @@ const HandTracker: React.FC = () => {
     
     // Reset Kalman filter after submission
     kalmanFilterRef.current = null;
-  };
+  }, [isRecording, digitToDraw, currentPath, submitDrawing]);
+  
+  const handleStartDrawing = useCallback(() => {
+    if (!webcamRunning || digitToDraw === null) return; // Don't start if no prompt
+    console.log(`Starting path recording for digit: ${digitToDraw}...`);
+    setCurrentPath([]); // Clear previous visual path
+    setPredictedDigit(null);
+    setPredictionConfidence(null);
+    setIsRecording(true);
+    
+    // Reset Kalman filter for new drawing
+    kalmanFilterRef.current = null;
+    // Reset threshold timer
+    timeBelowThresholdStartRef.current = null;
+  }, [webcamRunning, digitToDraw, setCurrentPath, setPredictedDigit, setPredictionConfidence, setIsRecording]);
 
   // Add Reset Drawing functionality
-  const handleResetDrawing = () => {
+  const handleResetDrawing = useCallback(() => {
     console.log("Drawing reset.");
     setCurrentPath([]);
     // Reset Kalman filter as done in handleStartDrawing
     kalmanFilterRef.current = null;
-  };
+    // Reset threshold timer
+    timeBelowThresholdStartRef.current = null;
+  }, [setCurrentPath]);
 
-  const submitDrawing = (pathToSend: Point[]) => { // Takes path as argument
-    if (digitToDraw === null || !pathToSend || !ws || ws.readyState !== WebSocket.OPEN) {
-         console.warn("Cannot submit drawing - no prompted digit, path missing, or WebSocket not connected.");
-         // Reset state partially?
-         setCurrentPath([]);
-         setDigitToDraw(null); // Force fetch next
-         return;
+  // --- Effect for MediaPipe Hand Detection and Drawing ---
+  useEffect(() => {
+    let animationFrameId: number | null = null;
+    
+    // Function to detect hands and update latestResults state
+    const detectHands = () => {
+      if (!handLandmarker || !videoRef.current || videoRef.current.readyState < 2) {
+        return false;
+      }
+      
+      const video = videoRef.current;
+      const startTimeMs = performance.now();
+      const detectionResults = handLandmarker.detectForVideo(video, startTimeMs);
+      setLatestResults(detectionResults);
+      return true;
+    };
+
+    const renderLoop = (time: number) => {
+        // Skip initial render
+        if (lastFrameTimeRef.current === 0) {
+          lastFrameTimeRef.current = time;
+          requestRef.current = requestAnimationFrame(renderLoop);
+          return;
+        }
+
+        // Update time reference for next frame
+        // We don't directly use this variable, but it's important for timestamping
+        // eslint-disable-next-line @typescript-eslint/no-unused-vars
+        const timeElapsedMs = time - lastFrameTimeRef.current;
+        lastFrameTimeRef.current = time;
+
+        // Detect hands and update latestResults
+        detectHands();
+
+        // Process hand landmarks if available
+        if (latestResults && latestResults.landmarks && latestResults.landmarks.length > 0) {
+          const handLandmarks = latestResults.landmarks[0]; // Get first hand's landmarks
+          if (handLandmarks && handLandmarks.length > 8) { // Ensure index finger tip (landmark 8) exists
+            // Extract index finger tip position
+            const indexTip = handLandmarks[8];
+            const normalizedPos = {
+              x: indexTip.x,
+              y: indexTip.y,
+            };
+
+            // Initialize Kalman filter if needed
+            if (!kalmanFilterRef.current) {
+              kalmanFilterRef.current = new KalmanFilter2D(normalizedPos.x, normalizedPos.y);
+            }
+
+            // Update Kalman filter with new measurement and get filtered position
+            // Pass time for timestamp-based filtering (uses timeElapsedMs indirectly)
+            const [filteredX, filteredY] = kalmanFilterRef.current.process(normalizedPos.x, normalizedPos.y, time);
+            
+            // Store the filtered position for use in path recording
+            const filteredFingerTip = {
+              x: filteredX,
+              y: filteredY,
+              z: indexTip.z // Preserve the original z coordinate if needed
+            };
+            
+            // Get velocity magnitude directly from the Kalman filter
+            const velocityMagnitude = kalmanFilterRef.current.getSpeed();
+
+            // Auto-stop drawing when velocity becomes very low
+            if (isRecording) {
+              // Add the filtered finger tip to the path FIRST
+              setCurrentPath(prevPath => [...prevPath, filteredFingerTip]);
+              
+              // NOW, check for auto-stop ONLY if path is long enough
+              if (currentPath.length > MIN_PATH_LENGTH_FOR_AUTOSTOP && kalmanFilterRef.current) {
+                if (velocityMagnitude < VELOCITY_STOP_THRESHOLD) {
+                  // If we haven't started timing yet, record the start time
+                  if (timeBelowThresholdStartRef.current === null) {
+                    timeBelowThresholdStartRef.current = time;
+                  } 
+                  // Check if we've been below threshold for long enough to stop
+                  else if ((time - timeBelowThresholdStartRef.current) >= STOP_DURATION_MS) {
+                    console.log(`Auto-stopping after ${STOP_DURATION_MS}ms below velocity threshold. Path length: ${currentPath.length}`);
+                    handleStopDrawing();
+                  }
+                } else {
+                  // Reset the timer if velocity goes above threshold
+                  timeBelowThresholdStartRef.current = null;
+                }
+              } else {
+                // Path too short or filter not ready, ensure timer is reset
+                timeBelowThresholdStartRef.current = null;
+              }
+            }
+          }
+        }
+
+        // --- Drawing ---
+        const canvasCtx = canvasRef.current?.getContext("2d");
+        if (canvasCtx && canvasRef.current) {
+            // Match canvas size to video
+            if (canvasRef.current.width !== videoRef.current?.videoWidth) {
+                 canvasRef.current.width = videoRef.current?.videoWidth || 640;
+            }
+            if (canvasRef.current.height !== videoRef.current?.videoHeight) {
+                 canvasRef.current.height = videoRef.current?.videoHeight || 480;
+            }
+
+            canvasCtx.save();
+            canvasCtx.clearRect(0, 0, canvasRef.current.width, canvasRef.current.height);
+            // Draw based on the LATEST results stored in state
+            if (latestResults && latestResults.landmarks && latestResults.landmarks.length > 0) {
+                // console.log('Drawing landmarks for', latestResults.landmarks.length, 'hands'); // Commented out - reduces noise
+                for (const landmarks of latestResults.landmarks) {
+                    drawLandmarks(canvasCtx, landmarks);
+                }
+                
+                // We've moved the path recording logic directly after Kalman filtering
+                // to ensure we use the filtered coordinates
+            }
+            
+            // Draw the recorded path
+            if (currentPath.length > 1) {
+                canvasCtx.strokeStyle = "#FFFFFF"; // White path
+                canvasCtx.lineWidth = 3;
+                canvasCtx.beginPath();
+                canvasCtx.moveTo(currentPath[0].x * canvasRef.current.width, currentPath[0].y * canvasRef.current.height);
+                for (let i = 1; i < currentPath.length; i++) {
+                    canvasCtx.lineTo(currentPath[i].x * canvasRef.current.width, currentPath[i].y * canvasRef.current.height);
+                }
+                canvasCtx.stroke();
+            }
+            
+            canvasCtx.restore();
+        }
+        
+        // Schedule next frame
+        animationFrameId = requestAnimationFrame(renderLoop);
+    };
+
+    if (webcamRunning && handLandmarker) {
+        animationFrameId = requestAnimationFrame(renderLoop); // Start loop
+    } else {
+        if (animationFrameId) cancelAnimationFrame(animationFrameId); // Clear if stopped
+        // Clear canvas
+        const canvasCtx = canvasRef.current?.getContext("2d");
+        if (canvasCtx && canvasRef.current) {
+            canvasCtx.clearRect(0, 0, canvasRef.current.width, canvasRef.current.height);
+        }
     }
-    console.log(`Submitting path for prompted label: ${digitToDraw}`);
-    try {
-        const dataToSend = JSON.stringify({ path: pathToSend, label: digitToDraw }); // Use digitToDraw state
-        ws.send(dataToSend);
-        console.log("Drawing path sent via WebSocket.");
-    } catch (error) {
-        console.error("Error sending drawing path via WebSocket:", error);
-    } finally {
-        // Reset state after submission attempt
-        setCurrentPath([]); // Clear visual path
-        setDigitToDraw(null); // Clear prompt, require user action for next one
-        // Prediction state (setPredictedDigit) will be updated by onmessage handler
-    }
-  };
+
+    // Cleanup animation frame on component unmount or when dependencies change
+    return () => {
+      if (animationFrameId) {
+        cancelAnimationFrame(animationFrameId);
+      }
+    };
+  }, [webcamRunning, handLandmarker, latestResults, isRecording, currentPath, handleStopDrawing]); // Added handleStopDrawing to dependencies
 
   // --- Enable/Disable Webcam ---
   const enableCam = async () => {
@@ -1054,4 +1084,4 @@ const HandTracker: React.FC = () => {
   );
 };
 
-export default HandTracker; 
+export default HandTracker;
