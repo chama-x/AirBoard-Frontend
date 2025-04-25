@@ -58,8 +58,8 @@ const HandTracker: React.FC = () => {
   const [latestResults, setLatestResults] = useState<HandLandmarkerResult | null>(null);
   const [isRecording, setIsRecording] = useState<boolean>(false);
   const [currentPath, setCurrentPath] = useState<Point[]>([]);
-  const [needsLabel, setNeedsLabel] = useState<boolean>(false);
-  const [lastPath, setLastPath] = useState<Point[] | null>(null); // Store path temporarily until labeled
+  const [digitToDraw, setDigitToDraw] = useState<number | null>(null);
+  const [lastPath, setLastPath] = useState<Point[] | null>(null); // Keep to store path on stop
   const [ws, setWs] = useState<WebSocket | null>(null);
   const [wsStatus, setWsStatus] = useState<WsStatus>('disconnected');
   const [predictedDigit, setPredictedDigit] = useState<number | string | null>(null);
@@ -68,45 +68,41 @@ const HandTracker: React.FC = () => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const requestRef = useRef<number | null>(null); // For requestAnimationFrame handle
 
-  // --- Basic Drawing Utility ---
-  const drawLandmarks = (ctx: CanvasRenderingContext2D, landmarks: NormalizedLandmark[]) => {
-      if (!landmarks) return;
-      // Simple drawing: draw circles for landmarks (index finger tip: 8)
-      ctx.fillStyle = '#FF0000'; // Red
-      ctx.strokeStyle = '#00FF00'; // Green for connectors (optional)
-      ctx.lineWidth = 2;
-
-      landmarks.forEach((landmark: NormalizedLandmark, index: number) => {
-          const x = landmark.x * ctx.canvas.width;
-          const y = landmark.y * ctx.canvas.height;
-          ctx.beginPath();
-          ctx.arc(x, y, 5, 0, 2 * Math.PI); // Draw circle
-          ctx.fill();
-          // Highlight index finger tip (landmark 8)
-          if (index === 8) {
-             ctx.fillStyle = '#0000FF'; // Blue
-             ctx.beginPath();
-             ctx.arc(x, y, 7, 0, 2 * Math.PI);
-             ctx.fill();
-             ctx.fillStyle = '#FF0000'; // Reset color
-          }
-      });
-      // Add drawing connectors if needed (e.g., using HandLandmarker.HAND_CONNECTIONS)
+  // --- Fetch Next Digit Prompt ---
+  const fetchNextDigitPrompt = async () => {
+    try {
+        // Assume backend runs on localhost:8000
+        // Use http:// not ws:// for this standard GET request
+        const response = await fetch('http://localhost:8000/next_digit_prompt');
+        if (!response.ok) {
+            throw new Error(`HTTP error! status: ${response.status}`);
+        }
+        const data = await response.json();
+        if (data && data.digit_to_draw !== undefined) {
+            console.log("Received prompt to draw digit:", data.digit_to_draw);
+            setDigitToDraw(data.digit_to_draw);
+        } else {
+             console.error("Received invalid prompt data:", data);
+             setDigitToDraw(null); // Indicate error or inability to get prompt
+        }
+    } catch (error) {
+        console.error("Error fetching next digit prompt:", error);
+        setDigitToDraw(null); // Indicate error
+    }
   };
 
   // --- WebSocket Connection Management ---
   useEffect(() => {
     console.log("Attempting WebSocket connection...");
     setWsStatus('connecting');
-    // Replace localhost with your machine's actual IP if testing on different devices,
-    // but localhost should work if backend server is running on the same machine.
     const websocketUrl = 'ws://localhost:8000/ws';
     const socket = new WebSocket(websocketUrl);
 
     socket.onopen = () => {
       console.log('WebSocket connection established.');
       setWsStatus('connected');
-      setWs(socket); // Store the connected socket object in state
+      setWs(socket);
+      fetchNextDigitPrompt(); // Fetch initial prompt when connected
     };
 
     socket.onmessage = (event) => {
@@ -298,19 +294,17 @@ const HandTracker: React.FC = () => {
 
   // --- Drawing Controls ---
   const handleStartDrawing = () => {
-    if (!webcamRunning) return;
-    console.log("Starting path recording...");
-    setCurrentPath([]);
-    setLastPath(null); // Clear stored path
-    setNeedsLabel(false); // Disable labeling UI
-    setPredictedDigit(null); // Clear previous prediction
+    if (!webcamRunning || digitToDraw === null) return; // Don't start if no prompt
+    console.log(`Starting path recording for digit: ${digitToDraw}...`);
+    setCurrentPath([]); // Clear previous visual path
+    setPredictedDigit(null);
     setPredictionConfidence(null);
     setIsRecording(true);
   };
 
   const handleStopDrawing = () => {
-    if (!isRecording) return;
-    console.log("Stopping path recording...");
+    if (!isRecording || digitToDraw === null) return; // Check digitToDraw too
+    console.log(`Stopping path recording for digit: ${digitToDraw}...`);
     setIsRecording(false);
 
     const rawPath = [...currentPath];
@@ -320,36 +314,36 @@ const HandTracker: React.FC = () => {
     console.log("Raw Path Recorded (Points):", rawPath.length, rawPath);
     console.log(`Smoothed Path (Window ${smoothingWindowSize}, Points):`, smoothedPath.length, smoothedPath);
 
-    if (smoothedPath.length > 1) { // Only enable labeling if path has data
-        setLastPath(smoothedPath); // Store the path to be labeled
-        setNeedsLabel(true);      // Enable labeling UI
+    if (smoothedPath.length > 1) {
+        // Immediately submit the path with the prompted label
+        submitDrawing(smoothedPath); // Call submit function
     } else {
-        console.log("Path too short, skipping labeling.");
-        setCurrentPath([]); // Clear path if too short
+        console.log("Path too short, skipping submission.");
+        setCurrentPath([]); // Clear visual path if too short
+        setDigitToDraw(null); // Clear prompt to force user to get next one
     }
-    // Don't clear currentPath here yet, maybe visualize the final smoothed path briefly?
   };
 
-  const submitLabeledPath = (label: number) => {
-    if (!lastPath || !ws || ws.readyState !== WebSocket.OPEN) {
-         console.warn("Cannot submit label - no path stored or WebSocket not connected.");
-         setNeedsLabel(false); // Hide labeling buttons even if submission fails
-         setCurrentPath([]); // Clear visual path
-         setLastPath(null);
+  const submitDrawing = (pathToSend: Point[]) => { // Takes path as argument
+    if (digitToDraw === null || !pathToSend || !ws || ws.readyState !== WebSocket.OPEN) {
+         console.warn("Cannot submit drawing - no prompted digit, path missing, or WebSocket not connected.");
+         // Reset state partially?
+         setCurrentPath([]);
+         setDigitToDraw(null); // Force fetch next
          return;
     }
-    console.log(`Submitting path as label: ${label}`);
+    console.log(`Submitting path for prompted label: ${digitToDraw}`);
     try {
-        const dataToSend = JSON.stringify({ path: lastPath, label: label }); // NEW FORMAT
+        const dataToSend = JSON.stringify({ path: pathToSend, label: digitToDraw }); // Use digitToDraw state
         ws.send(dataToSend);
-        console.log("Labeled path sent via WebSocket.");
+        console.log("Drawing path sent via WebSocket.");
     } catch (error) {
-        console.error("Error sending labeled path via WebSocket:", error);
+        console.error("Error sending drawing path via WebSocket:", error);
     } finally {
         // Reset state after submission attempt
-        setNeedsLabel(false);
         setCurrentPath([]); // Clear visual path
-        setLastPath(null);
+        setDigitToDraw(null); // Clear prompt, require user action for next one
+        // Prediction state (setPredictedDigit) will be updated by onmessage handler
     }
   };
 
@@ -411,6 +405,52 @@ const HandTracker: React.FC = () => {
         WebSocket: {wsStatus}
       </div>
       
+      <div style={{ margin: '20px auto', textAlign: 'center', height: '80px', width:'100%' }}>
+        {digitToDraw !== null ? (
+             <p style={{ 
+               fontSize: '2.5em', 
+               fontWeight: 'bold', 
+               color: '#4CAF50', 
+               backgroundColor: 'rgba(255, 255, 255, 0.8)',
+               padding: '10px 20px',
+               borderRadius: '8px',
+               display: 'inline-block'
+             }}>
+                 Please Draw: {digitToDraw}
+             </p>
+           ) : (
+             webcamRunning ? (
+                  <button 
+                    onClick={fetchNextDigitPrompt} 
+                    style={{
+                      padding: '12px 20px', 
+                      fontSize: '18px',
+                      backgroundColor: '#2196F3',
+                      color: 'white',
+                      border: 'none',
+                      borderRadius: '4px',
+                      cursor: 'pointer',
+                      boxShadow: '0 2px 5px rgba(0,0,0,0.2)'
+                    }}
+                  >
+                    Get Next Digit
+                  </button>
+             ) : (
+                 <p style={{ 
+                   fontSize: '1.5em', 
+                   color: '#757575',
+                   backgroundColor: 'rgba(255, 255, 255, 0.8)',
+                   padding: '10px',
+                   borderRadius: '4px',
+                   display: 'inline-block'
+                 }}>
+                   Enable webcam to start.
+                 </p>
+             )
+           )
+        }
+      </div>
+      
       {loading ? (
         <p>Loading hand tracking model...</p>
       ) : (
@@ -444,14 +484,14 @@ const HandTracker: React.FC = () => {
             
             <button 
               onClick={handleStartDrawing} 
-              disabled={!webcamRunning || isRecording || loading} 
+              disabled={!webcamRunning || isRecording || loading || digitToDraw === null} 
               style={{
                 position: 'absolute', 
                 bottom: '50px', 
                 left: '10px', 
                 zIndex: 10, 
                 padding: '10px', 
-                backgroundColor: isRecording ? 'grey' : 'lightgreen',
+                backgroundColor: (!webcamRunning || digitToDraw === null) ? 'grey' : (isRecording ? 'grey' : 'lightgreen'),
                 color: 'black',
                 fontSize: '14px',
                 border: '2px solid black'
@@ -528,36 +568,6 @@ const HandTracker: React.FC = () => {
               </h2>
             )}
           </div>
-          
-          {needsLabel && (
-            <div style={{ marginTop: '15px', textAlign: 'center' }}>
-              <h3 style={{ color: '#333', marginBottom: '10px', backgroundColor: 'rgba(255, 255, 255, 0.8)', padding: '5px', borderRadius: '4px', display: 'inline-block' }}>
-                What digit did you draw?
-              </h3>
-              <div>
-                {[0, 1, 2, 3, 4, 5, 6, 7, 8, 9].map((digit) => (
-                  <button
-                    key={digit}
-                    onClick={() => submitLabeledPath(digit)}
-                    style={{ 
-                      padding: '10px 15px', 
-                      margin: '4px', 
-                      fontSize: '18px', 
-                      minWidth: '50px',
-                      backgroundColor: '#4CAF50',
-                      color: 'white',
-                      border: 'none',
-                      borderRadius: '4px',
-                      cursor: 'pointer',
-                      boxShadow: '0 2px 5px rgba(0,0,0,0.2)'
-                    }}
-                  >
-                    {digit}
-                  </button>
-                ))}
-              </div>
-            </div>
-          )}
         </>
       )}
     </div>
