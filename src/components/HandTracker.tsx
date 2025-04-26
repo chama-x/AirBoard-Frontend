@@ -14,12 +14,15 @@ const INITIAL_COVARIANCE_P = 1.0; // Initial state covariance - higher means les
 const DT = 1/30; // Time delta between frames in seconds - 30 FPS assumption
 const VELOCITY_STOP_THRESHOLD = 0.08; // Velocity threshold for auto-stopping recording (needs tuning)
 const STOP_DURATION_MS = 300; // ms - Time speed must be below threshold to stop (needs tuning)
-const MIN_PATH_LENGTH_FOR_AUTOSTOP = 30; // Minimum number of points needed before auto-stop can activate
+const MIN_PATH_LENGTH_FOR_AUTOSTOP = 10; // Minimum number of points needed before auto-stop can activate
 
 // Path trimming constants
 const TRIM_MIN_PATH_LENGTH = 5; // Min points needed to attempt trimming
 const TRIM_WINDOW_SIZE = 4;      // How many points to average over
 const TRIM_VARIANCE_THRESHOLD = 0.0001; // Threshold for variance detection (needs tuning)
+
+// Local storage key for saving collected data
+const LOCAL_STORAGE_KEY = 'airboard_collected_data';
 
 /**
  * 2D Kalman Filter for smoothing finger tip trajectories
@@ -679,26 +682,74 @@ const HandTracker: React.FC = () => {
 
   // --- Drawing Controls ---
   const submitDrawing = useCallback((pathToSend: Point[]) => { // Takes path as argument
-    if (digitToDraw === null || !pathToSend || !ws || ws.readyState !== WebSocket.OPEN) {
-         console.warn("Cannot submit drawing - no prompted digit, path missing, or WebSocket not connected.");
+    if (digitToDraw === null || !pathToSend || pathToSend.length < 2) {
+         console.warn("Cannot submit drawing - no prompted digit or invalid path.");
          // Reset state partially?
          setCurrentPath([]);
          setDigitToDraw(null); // Force fetch next
          return;
     }
+    
     console.log(`Submitting path for prompted label: ${digitToDraw}`);
+    
+    // --- Start of Local Storage Logic ---
     try {
-        const dataToSend = JSON.stringify({ path: pathToSend, label: digitToDraw }); // Use digitToDraw state
-        ws.send(dataToSend);
-        console.log("Drawing path sent via WebSocket.");
+        // 1. Get existing data string from localStorage
+        const existingDataString = localStorage.getItem(LOCAL_STORAGE_KEY);
+
+        // 2. Parse existing data (or initialize if none)
+        let dataArray: { label: number, path: Point[] }[] = [];
+        if (existingDataString) {
+            try {
+                dataArray = JSON.parse(existingDataString);
+                if (!Array.isArray(dataArray)) { // Basic validation
+                   console.warn("Invalid data found in localStorage, resetting.");
+                   dataArray = [];
+                }
+            } catch (parseError) {
+                console.error("Error parsing data from localStorage:", parseError);
+                // Optionally reset if parsing fails
+                dataArray = []; 
+            }
+        }
+
+        // 3. Create new entry
+        const newEntry = { label: digitToDraw, path: pathToSend };
+
+        // 4. Append new entry
+        dataArray.push(newEntry);
+
+        // 5. Stringify updated array
+        const updatedDataString = JSON.stringify(dataArray);
+
+        // 6. Save back to localStorage
+        localStorage.setItem(LOCAL_STORAGE_KEY, updatedDataString);
+        console.log(`Drawing for digit ${digitToDraw} saved locally. Total samples: ${dataArray.length}`);
+
     } catch (error) {
-        console.error("Error sending drawing path via WebSocket:", error);
-    } finally {
-        // Reset state after submission attempt
-        setCurrentPath([]); // Clear visual path
-        setDigitToDraw(null); // Clear prompt, require user action for next one
-        // Prediction state (setPredictedDigit) will be updated by onmessage handler
+        console.error("Error saving data to localStorage:", error);
+        // Handle potential errors like quota exceeded
+        alert("Error saving data locally. Local storage might be full.");
     }
+    // --- End of Local Storage Logic ---
+    
+    // Try to send via WebSocket if available (can be disabled if not needed)
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      try {
+          const dataToSend = JSON.stringify({ path: pathToSend, label: digitToDraw }); // Use digitToDraw state
+          ws.send(dataToSend);
+          console.log("Drawing path also sent via WebSocket.");
+      } catch (error) {
+          console.error("Error sending drawing path via WebSocket:", error);
+      }
+    } else {
+        console.warn("WebSocket not open, skipping send but data was saved locally.");
+    }
+    
+    // Reset state after submission attempt
+    setCurrentPath([]); // Clear visual path
+    setDigitToDraw(null); // Clear prompt, require user action for next one
+    // Prediction state (setPredictedDigit) will be updated by onmessage handler
   }, [digitToDraw, ws, setCurrentPath, setDigitToDraw]);
 
   const handleStopDrawing = useCallback(() => {
