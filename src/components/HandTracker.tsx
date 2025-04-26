@@ -1,5 +1,6 @@
 import React, { useEffect, useRef, useState, useCallback } from 'react';
 import { HandLandmarker, FilesetResolver, HandLandmarkerResult, NormalizedLandmark } from '@mediapipe/tasks-vision';
+import { PlayIcon, StopIcon, ArrowPathIcon, VideoCameraIcon, VideoCameraSlashIcon } from '@heroicons/react/24/solid';
 // Assuming you might have drawing_utils from MediaPipe or a custom one
 // If using MediaPipe's utils directly, you might need to install @mediapipe/drawing_utils
 // For now, let's use the basic drawing function defined inside.
@@ -1008,54 +1009,57 @@ const HandTracker: React.FC = () => {
   // console.log("HandTracker Component Render - Loading state:", loading); // Commented out - reduces noise
 
   return (
-    <div className="flex flex-col md:flex-row gap-4 p-4 bg-gray-900 text-gray-200 min-h-screen">
+    <div className="flex flex-col md:flex-row gap-4 p-4 bg-gray-900 text-gray-200 min-h-screen font-sans">
       {/* Left column - Video/Canvas area */}
-      <div className="relative w-full md:w-1/2 lg:w-3/5 border border-gray-700">
-        <h2 className="text-xl mb-4 text-center">Hand Tracking with MediaPipe</h2>
+      <div className="relative w-full md:w-1/2 lg:w-3/5 border border-gray-700 rounded-lg overflow-hidden shadow-md">
+        <h2 className="text-2xl font-semibold mb-6 text-white text-center py-3 border-b border-gray-800">Hand Tracking with MediaPipe</h2>
         
-        <div className="connection-status mb-2 p-1 text-sm rounded" style={{ 
-          backgroundColor: 
-            wsStatus === 'connected' ? '#dff0d8' : 
-            wsStatus === 'connecting' ? '#fcf8e3' : 
-            wsStatus === 'error' ? '#f2dede' : '#f8f9fa',
-          color: 
-            wsStatus === 'connected' ? '#3c763d' : 
-            wsStatus === 'connecting' ? '#8a6d3b' : 
-            wsStatus === 'error' ? '#a94442' : '#6c757d',
-        }}>
-          WebSocket: {wsStatus}
-        </div>
-        
-        <div className="mb-4 text-center h-20">
-          {digitToDraw !== null ? (
-            <p className="text-2xl font-bold p-2 bg-gray-800 inline-block rounded">
-              Please Draw: <span className="text-green-500">{digitToDraw}</span>
-            </p>
-          ) : (
-            webcamRunning ? (
-              <button 
-                onClick={fetchNextDigitPrompt} 
-                className="bg-blue-500 hover:bg-blue-600 text-white px-4 py-2 rounded"
-              >
-                Get Next Digit
-              </button>
-            ) : (
-              <p className="text-lg text-gray-400 p-2">
-                Enable webcam to start.
+        <div className="px-4 mb-4">
+          <div className="flex items-center mb-2">
+            <span className={`inline-block h-3 w-3 rounded-full mr-2 ${
+              wsStatus === 'connected' ? 'bg-green-500' : 
+              wsStatus === 'connecting' ? 'bg-yellow-500' : 
+              wsStatus === 'error' ? 'bg-red-500' : 'bg-gray-500'
+            }`}></span>
+            <span className="text-sm font-medium">
+              WebSocket: {wsStatus}
+            </span>
+          </div>
+          
+          <div className="mb-6 text-center h-24 flex items-center justify-center">
+            {digitToDraw !== null ? (
+              <p className="text-center text-5xl font-bold mb-2 text-blue-400 bg-gray-800/60 py-3 px-6 rounded-lg shadow-inner">
+                Please Draw: <span className="text-green-400">{digitToDraw}</span>
               </p>
-            )
-          )}
+            ) : (
+              webcamRunning ? (
+                <button 
+                  onClick={fetchNextDigitPrompt} 
+                  className="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-md font-semibold transition duration-150 ease-in-out focus:outline-hidden focus:ring-3 focus:ring-offset-2 focus:ring-offset-gray-800 focus:ring-blue-500"
+                >
+                  Get Next Digit
+                </button>
+              ) : (
+                <p className="text-lg text-gray-400 p-2">
+                  Enable webcam to start.
+                </p>
+              )
+            )}
+          </div>
         </div>
         
         {loading ? (
-          <p className="text-center">Loading hand tracking model...</p>
+          <div className="text-center py-12">
+            <div className="inline-block animate-spin rounded-full h-12 w-12 border-t-2 border-b-2 border-blue-500 mb-4"></div>
+            <p className="text-lg text-gray-300">Loading hand tracking model...</p>
+          </div>
         ) : (
-          <div className="relative">
+          <div className="relative aspect-video mx-auto">
             <video 
               ref={videoRef}
               autoPlay 
               playsInline
-              className="w-full h-auto block"
+              className="w-full h-full block rounded-md"
               style={{ 
                 transform: 'scaleX(-1)', // Mirror horizontally
                 display: webcamRunning ? 'block' : 'none'
@@ -1063,7 +1067,7 @@ const HandTracker: React.FC = () => {
             />
             <canvas
               ref={canvasRef}
-              className="absolute top-0 left-0 w-full h-full block"
+              className="absolute top-0 left-0 w-full h-full block rounded-md"
               style={{
                 transform: 'scaleX(-1)', // Mirror to match video
                 display: webcamRunning ? 'block' : 'none'
@@ -1072,63 +1076,102 @@ const HandTracker: React.FC = () => {
           </div>
         )}
         
-        <div className="flex justify-between mt-4">
-          {!webcamRunning ? (
-            <button 
-              onClick={enableCam} 
-              disabled={!handLandmarker}
-              className="bg-yellow-400 text-black font-medium px-4 py-2 rounded disabled:opacity-50"
-            >
-              Enable Webcam
-            </button>
-          ) : (
-            <button 
-              onClick={disableCam}
-              className="bg-yellow-400 text-black font-medium px-4 py-2 rounded"
-            >
-              Disable Webcam
-            </button>
-          )}
-        </div>
+        <div className="p-4 mt-2">
+          <div className="flex justify-between">
+            {!webcamRunning ? (
+              <button 
+                onClick={enableCam} 
+                disabled={!handLandmarker}
+                className="w-full px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-md font-semibold transition duration-150 ease-in-out focus:outline-hidden focus:ring-3 focus:ring-offset-2 focus:ring-offset-gray-800 focus:ring-blue-500 disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-x-2"
+              >
+                <VideoCameraIcon className="h-5 w-5" />
+                Enable Webcam
+              </button>
+            ) : (
+              <button 
+                onClick={disableCam}
+                className="w-full px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-md font-semibold transition duration-150 ease-in-out focus:outline-hidden focus:ring-3 focus:ring-offset-2 focus:ring-offset-gray-800 focus:ring-blue-500 flex items-center justify-center gap-x-2"
+              >
+                <VideoCameraSlashIcon className="h-5 w-5" />
+                Disable Webcam
+              </button>
+            )}
+          </div>
 
-        <div className="mt-4 text-center h-16">
-          {predictedDigit !== null && (
-            <h2 className="text-2xl font-bold text-blue-400 bg-gray-800 inline-block p-2 rounded">
-              Detected: {String(predictedDigit)}
-              {predictionConfidence !== null && ` (${(predictionConfidence * 100).toFixed(1)}%)`}
-            </h2>
-          )}
+          <div className="mt-6 text-center">
+            <p className="text-center font-medium mb-2 text-sm text-gray-400">
+              {isRecording ? 'Status: ' : ''}
+              <span className={isRecording ? 'text-yellow-400 font-bold' : 'text-gray-500'}>
+                {isRecording ? 'RECORDING' : ''}
+              </span>
+            </p>
+            
+            {predictedDigit !== null && (
+              <h2 className="text-center text-2xl font-semibold mt-3 bg-gray-800 inline-block px-6 py-2 rounded-lg">
+                Detected: <span className="text-blue-400 font-bold">{String(predictedDigit)}</span>
+                {predictionConfidence !== null && 
+                  <span className="text-sm ml-2 text-gray-400">
+                    ({(predictionConfidence * 100).toFixed(1)}%)
+                  </span>
+                }
+              </h2>
+            )}
+          </div>
         </div>
       </div>
       
       {/* Right column - Controls */}
-      <div className="w-full md:w-1/2 lg:w-2/5 bg-gray-800 p-4 rounded-lg shadow-lg">
-        <h3 className="text-xl mb-4 border-b border-gray-700 pb-2">Controls</h3>
+      <div className="w-full md:w-1/2 lg:w-2/5 bg-gray-800 p-6 rounded-lg shadow-md">
+        <h3 className="text-2xl font-semibold mb-6 text-white border-b border-gray-700 pb-3">Controls</h3>
         
-        <div className="flex flex-col gap-3">
+        <div className="flex flex-col space-y-4">
           <button 
             onClick={handleStartDrawing} 
             disabled={!webcamRunning || isRecording || loading || digitToDraw === null} 
-            className="bg-green-500 hover:bg-green-600 text-white px-4 py-2 rounded disabled:opacity-50 disabled:cursor-not-allowed"
+            className="w-full px-4 py-2 bg-green-700 hover:bg-green-600 text-white rounded-md font-semibold transition duration-150 ease-in-out focus:outline-hidden focus:ring-3 focus:ring-offset-2 focus:ring-offset-gray-800 focus:ring-green-500 disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-x-2"
           >
+            <PlayIcon className="h-5 w-5" />
             Start Drawing
           </button>
           
           <button 
             onClick={handleStopDrawing} 
             disabled={!webcamRunning || !isRecording || loading} 
-            className="bg-orange-500 hover:bg-orange-600 text-white px-4 py-2 rounded disabled:opacity-50 disabled:cursor-not-allowed"
+            className="w-full px-4 py-2 bg-yellow-600 hover:bg-yellow-500 text-white rounded-md font-semibold transition duration-150 ease-in-out focus:outline-hidden focus:ring-3 focus:ring-offset-2 focus:ring-offset-gray-800 focus:ring-yellow-400 disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-x-2"
           >
+            <StopIcon className="h-5 w-5" />
             Stop Drawing
           </button>
           
           <button 
             onClick={handleResetDrawing} 
             disabled={currentPath.length === 0 || loading} 
-            className="bg-red-500 hover:bg-red-600 text-white px-4 py-2 rounded disabled:opacity-50 disabled:cursor-not-allowed"
+            className="w-full px-4 py-2 bg-red-700 hover:bg-red-600 text-white rounded-md font-semibold transition duration-150 ease-in-out focus:outline-hidden focus:ring-3 focus:ring-offset-2 focus:ring-offset-gray-800 focus:ring-red-500 disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-x-2"
           >
+            <ArrowPathIcon className="h-5 w-5" />
             Reset Drawing
           </button>
+        </div>
+        
+        <div className="mt-10 pt-4 border-t border-gray-700">
+          <h4 className="text-lg font-medium mb-4 text-gray-300">How to Use</h4>
+          <ol className="list-decimal list-inside space-y-2 text-gray-400">
+            <li>Enable your webcam</li>
+            <li>Click &quot;Get Next Digit&quot; to receive a prompt</li>
+            <li>Position your index finger in view of the camera</li>
+            <li>Click &quot;Start Drawing&quot; and draw the prompted digit in the air</li>
+            <li>Drawing will auto-stop when you finish, or click &quot;Stop Drawing&quot;</li>
+          </ol>
+          
+          <div className="mt-6 p-4 bg-gray-900 rounded-md">
+            <h5 className="text-md font-medium mb-2 text-gray-300">Tips</h5>
+            <ul className="list-disc list-inside text-sm text-gray-400">
+              <li>Draw large, clear digits</li>
+              <li>Keep your hand in the camera view at all times</li>
+              <li>Position yourself in good lighting</li>
+              <li>Hold your position after drawing for automatic stopping</li>
+            </ul>
+          </div>
         </div>
       </div>
     </div>

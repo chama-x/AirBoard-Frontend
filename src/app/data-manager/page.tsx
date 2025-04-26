@@ -3,9 +3,6 @@
 import { useState, useEffect, useRef } from "react";
 import { TrashIcon, CheckIcon } from "@heroicons/react/24/outline";
 
-// Define the correct storage key
-const LOCAL_STORAGE_KEY = 'airboard_collected_data';
-
 // Types
 type Point = {
   x: number;
@@ -14,9 +11,8 @@ type Point = {
 
 type DrawingData = {
   id: string;
-  label: number; // Added label field
   timestamp: number;
-  points: Point[]; // Maps to 'path' in the original data
+  points: Point[];
 };
 
 // Path Thumbnail Component
@@ -103,8 +99,7 @@ const PathThumbnail = ({
         </div>
       )}
       <div className="absolute bottom-0 left-0 right-0 bg-black/50 text-white text-xs p-1">
-        <span className="mr-2">Label: {drawing.label}</span>
-        <span>{new Date(drawing.timestamp).toLocaleString()}</span>
+        {new Date(drawing.timestamp).toLocaleString()}
       </div>
     </div>
   );
@@ -121,37 +116,29 @@ export default function DataManager() {
     setIsLoading(true);
     
     try {
-      // Get data from localStorage using the correct key
-      const dataString = localStorage.getItem(LOCAL_STORAGE_KEY);
-      let loadedData: { label: number, path: Point[] }[] = []; // Type matching saved data
-
-      if (dataString) {
+      const localStorageKeys = Object.keys(localStorage);
+      const drawingKeys = localStorageKeys.filter(key => key.startsWith("drawing_"));
+      
+      const loadedDrawings: DrawingData[] = [];
+      
+      drawingKeys.forEach(key => {
         try {
-          const parsedData = JSON.parse(dataString);
-          if (Array.isArray(parsedData)) {
-            loadedData = parsedData;
-          } else {
-            console.warn("Data in localStorage was not an array, resetting.");
+          const data = JSON.parse(localStorage.getItem(key) || "");
+          if (data && data.points && Array.isArray(data.points)) {
+            loadedDrawings.push({
+              id: key,
+              timestamp: data.timestamp || Date.now(),
+              points: data.points
+            });
           }
         } catch (e) {
-          console.error("Error parsing data from localStorage:", e);
-          // Optionally clear corrupted data: localStorage.removeItem(LOCAL_STORAGE_KEY);
+          console.error("Error parsing drawing data", e);
         }
-      }
-      
-      // Map the loaded data to the DrawingData format
-      const loadedDrawings: DrawingData[] = loadedData.map((item, index) => ({
-        id: `drawing_${index}_${Date.now()}`, // Generate a unique ID
-        label: item.label,
-        timestamp: Date.now() - (index * 1000), // Generate timestamps if not present
-        points: item.path // Map 'path' property to 'points'
-      }));
+      });
       
       // Sort by timestamp, newest first
       loadedDrawings.sort((a, b) => b.timestamp - a.timestamp);
       setDrawings(loadedDrawings);
-      
-      console.log(`Loaded ${loadedDrawings.length} drawings from localStorage`);
     } catch (error) {
       console.error("Failed to load drawings from localStorage", error);
     } finally {
@@ -182,24 +169,13 @@ export default function DataManager() {
     
     if (!confirmed) return;
     
-    // Update state first
-    setDrawings(prev => {
-      const remainingDrawings = prev.filter(drawing => !selectedIds.has(drawing.id));
-      
-      // Update localStorage with remaining drawings
-      try {
-        const dataToSave = remainingDrawings.map(drawing => ({
-          label: drawing.label,
-          path: drawing.points
-        }));
-        localStorage.setItem(LOCAL_STORAGE_KEY, JSON.stringify(dataToSave));
-      } catch (e) {
-        console.error("Error saving updated drawings to localStorage", e);
-      }
-      
-      return remainingDrawings;
+    // Delete from localStorage
+    selectedIds.forEach(id => {
+      localStorage.removeItem(id);
     });
     
+    // Update state
+    setDrawings(prev => prev.filter(drawing => !selectedIds.has(drawing.id)));
     setSelectedIds(new Set());
   };
 
