@@ -3,6 +3,9 @@
 import { useState, useEffect, useRef } from "react";
 import { TrashIcon, CheckIcon } from "@heroicons/react/24/outline";
 
+// Define the correct storage key
+const LOCAL_STORAGE_KEY = 'airboard_collected_data';
+
 // Types
 type Point = {
   x: number;
@@ -11,8 +14,9 @@ type Point = {
 
 type DrawingData = {
   id: string;
+  label: number; // Added label field
   timestamp: number;
-  points: Point[];
+  points: Point[]; // Maps to 'path' in the original data
 };
 
 // Path Thumbnail Component
@@ -34,10 +38,27 @@ const PathThumbnail = ({
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
 
+    // Debug flag for the first drawing to avoid console flooding
+    const shouldDebug = drawing.id.endsWith('-0');
+
     // Clear canvas
     ctx.clearRect(0, 0, canvas.width, canvas.height);
 
-    // Find min and max coordinates to scale the drawing
+    // Guard against empty paths
+    if (!drawing.points || drawing.points.length === 0) {
+      if (shouldDebug) console.log("PathThumbnail: Empty points array, nothing to draw");
+      return;
+    }
+
+    if (shouldDebug) {
+      console.log(`PathThumbnail Debug - Drawing ID: ${drawing.id}, Label: ${drawing.label}, Points: ${drawing.points.length}`);
+      
+      // Log a sample of raw points to check their format and values
+      const samplePoints = drawing.points.slice(0, Math.min(5, drawing.points.length));
+      console.log("Sample points:", JSON.stringify(samplePoints, null, 2));
+    }
+    
+    // Find min and max coordinates
     let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
     
     drawing.points.forEach(point => {
@@ -47,26 +68,73 @@ const PathThumbnail = ({
       maxY = Math.max(maxY, point.y);
     });
 
-    // Add padding
-    const padding = 10;
-    const drawingWidth = maxX - minX + 2 * padding;
-    const drawingHeight = maxY - minY + 2 * padding;
-    
-    // Calculate scale factor
-    const scaleX = canvas.width / drawingWidth;
-    const scaleY = canvas.height / drawingHeight;
+    // Guard against calculation issues
+    if (minX === Infinity || minY === Infinity || maxX === -Infinity || maxY === -Infinity) {
+      console.warn("PathThumbnail: Invalid bounds calculated, using defaults");
+      minX = 0;
+      minY = 0;
+      maxX = 1;
+      maxY = 1;
+    }
+
+    // Calculate range width and height, prevent zero values
+    const rangeWidth = Math.max(maxX - minX, 0.001);
+    const rangeHeight = Math.max(maxY - minY, 0.001);
+
+    // Define padding
+    const padding = 20;
+
+    // Calculate available space on canvas
+    const availableWidth = canvas.width - (2 * padding);
+    const availableHeight = canvas.height - (2 * padding);
+
+    // Calculate scale factors
+    const scaleX = availableWidth / rangeWidth;
+    const scaleY = availableHeight / rangeHeight;
     const scale = Math.min(scaleX, scaleY);
+
+    // Calculate scaled dimensions of the path
+    const scaledWidth = rangeWidth * scale;
+    const scaledHeight = rangeHeight * scale;
+
+    // Calculate offsets for centering
+    const offsetX = padding + (availableWidth - scaledWidth) / 2;
+    const offsetY = padding + (availableHeight - scaledHeight) / 2;
+
+    if (shouldDebug) {
+      console.log(`Range: width=${rangeWidth.toFixed(4)}, height=${rangeHeight.toFixed(4)}`);
+      console.log(`Canvas size: ${canvas.width}x${canvas.height}, Available: ${availableWidth}x${availableHeight}`);
+      console.log(`Scale factors: scaleX=${scaleX.toFixed(4)}, scaleY=${scaleY.toFixed(4)}, using scale=${scale.toFixed(4)}`);
+      console.log(`Scaled size: width=${scaledWidth.toFixed(4)}, height=${scaledHeight.toFixed(4)}`);
+      console.log(`Offsets for centering: offsetX=${offsetX.toFixed(4)}, offsetY=${offsetY.toFixed(4)}`);
+      
+      // Log sample transformed points
+      if (drawing.points.length > 0) {
+        const firstPoint = drawing.points[0];
+        const lastPoint = drawing.points[drawing.points.length - 1];
+        
+        const firstTransformedX = offsetX + (firstPoint.x - minX) * scale;
+        const firstTransformedY = offsetY + (firstPoint.y - minY) * scale;
+        
+        const lastTransformedX = offsetX + (lastPoint.x - minX) * scale;
+        const lastTransformedY = offsetY + (lastPoint.y - minY) * scale;
+        
+        console.log(`First point: original(${firstPoint.x.toFixed(4)}, ${firstPoint.y.toFixed(4)}) → transformed(${firstTransformedX.toFixed(4)}, ${firstTransformedY.toFixed(4)})`);
+        console.log(`Last point: original(${lastPoint.x.toFixed(4)}, ${lastPoint.y.toFixed(4)}) → transformed(${lastTransformedX.toFixed(4)}, ${lastTransformedY.toFixed(4)})`);
+      }
+    }
 
     // Draw the path
     ctx.beginPath();
-    ctx.strokeStyle = "#000000";
-    ctx.lineWidth = 2;
+    ctx.strokeStyle = "#FFFFFF";
+    ctx.lineWidth = 3;
     ctx.lineCap = "round";
     ctx.lineJoin = "round";
 
     drawing.points.forEach((point, index) => {
-      const x = (point.x - minX + padding) * scale;
-      const y = (point.y - minY + padding) * scale;
+      // Apply transformation: shift to origin, scale, then offset
+      const x = offsetX + (point.x - minX) * scale;
+      const y = offsetY + (point.y - minY) * scale;
       
       if (index === 0) {
         ctx.moveTo(x, y);
@@ -92,14 +160,15 @@ const PathThumbnail = ({
       }`}
       onClick={onClick}
     >
-      <canvas ref={canvasRef} width={150} height={150} className="w-full h-full" />
+      <canvas ref={canvasRef} width={150} height={150} className="w-full h-full bg-gray-800 -scale-x-100" />
       {isSelected && (
         <div className="absolute top-2 right-2 bg-blue-500 rounded-full p-1">
           <CheckIcon className="w-4 h-4 text-white" />
         </div>
       )}
       <div className="absolute bottom-0 left-0 right-0 bg-black/50 text-white text-xs p-1">
-        {new Date(drawing.timestamp).toLocaleString()}
+        <span className="mr-2">Label: {drawing.label}</span>
+        <span>{new Date(drawing.timestamp).toLocaleString()}</span>
       </div>
     </div>
   );
@@ -116,29 +185,42 @@ export default function DataManager() {
     setIsLoading(true);
     
     try {
-      const localStorageKeys = Object.keys(localStorage);
-      const drawingKeys = localStorageKeys.filter(key => key.startsWith("drawing_"));
-      
-      const loadedDrawings: DrawingData[] = [];
-      
-      drawingKeys.forEach(key => {
+      // Get data from localStorage using the correct key
+      const dataString = localStorage.getItem(LOCAL_STORAGE_KEY);
+      let loadedData: { label: number, path: Point[] }[] = []; // Type matching saved data
+
+      if (dataString) {
         try {
-          const data = JSON.parse(localStorage.getItem(key) || "");
-          if (data && data.points && Array.isArray(data.points)) {
-            loadedDrawings.push({
-              id: key,
-              timestamp: data.timestamp || Date.now(),
-              points: data.points
-            });
+          const parsedData = JSON.parse(dataString);
+          if (Array.isArray(parsedData)) {
+            loadedData = parsedData;
+          } else {
+            console.warn("Data in localStorage was not an array, resetting.");
+            loadedData = []; // Reset if not an array
           }
         } catch (e) {
-          console.error("Error parsing drawing data", e);
+          console.error("Error parsing data from localStorage:", e);
+          loadedData = []; // Reset on parsing error
+          // Optionally clear corrupted data: localStorage.removeItem(LOCAL_STORAGE_KEY);
         }
-      });
+      } else {
+        console.log("No data found in localStorage for key:", LOCAL_STORAGE_KEY);
+        loadedData = []; // Ensure it's an empty array if no data found
+      }
+      
+      // Map loaded data to the DrawingData structure expected by the component state
+      const mappedDrawings: DrawingData[] = loadedData.map((item, index) => ({
+        id: `${Date.now()}-${index}`, // Generate a unique ID
+        label: item.label, // Map label
+        timestamp: (item as { timestamp?: number }).timestamp || Date.now() - (index * 1000), // Use saved timestamp if exists, else generate
+        points: item.path // Map path to points
+      }));
       
       // Sort by timestamp, newest first
-      loadedDrawings.sort((a, b) => b.timestamp - a.timestamp);
-      setDrawings(loadedDrawings);
+      mappedDrawings.sort((a, b) => b.timestamp - a.timestamp);
+      
+      setDrawings(mappedDrawings);
+      console.log(`Loaded ${mappedDrawings.length} drawings from localStorage.`);
     } catch (error) {
       console.error("Failed to load drawings from localStorage", error);
     } finally {
@@ -169,13 +251,24 @@ export default function DataManager() {
     
     if (!confirmed) return;
     
-    // Delete from localStorage
-    selectedIds.forEach(id => {
-      localStorage.removeItem(id);
+    // Update state first
+    setDrawings(prev => {
+      const remainingDrawings = prev.filter(drawing => !selectedIds.has(drawing.id));
+      
+      // Update localStorage with remaining drawings
+      try {
+        const dataToSave = remainingDrawings.map(drawing => ({
+          label: drawing.label,
+          path: drawing.points
+        }));
+        localStorage.setItem(LOCAL_STORAGE_KEY, JSON.stringify(dataToSave));
+      } catch (e) {
+        console.error("Error saving updated drawings to localStorage", e);
+      }
+      
+      return remainingDrawings;
     });
     
-    // Update state
-    setDrawings(prev => prev.filter(drawing => !selectedIds.has(drawing.id)));
     setSelectedIds(new Set());
   };
 
@@ -199,14 +292,14 @@ export default function DataManager() {
         <div className="space-x-2">
           <button
             onClick={selectAll}
-            className="px-4 py-2 bg-gray-200 hover:bg-gray-300 rounded-sm"
+            className="px-4 py-2 bg-gray-900 hover:bg-gray-800 rounded-sm"
             disabled={drawings.length === 0}
           >
             Select All
           </button>
           <button
             onClick={clearSelection}
-            className="px-4 py-2 bg-gray-200 hover:bg-gray-300 rounded-sm"
+            className="px-4 py-2 bg-gray-900 hover:bg-gray-800 rounded-sm"
             disabled={selectedIds.size === 0}
           >
             Clear Selection

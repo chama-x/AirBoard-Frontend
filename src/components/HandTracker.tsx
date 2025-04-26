@@ -20,7 +20,7 @@ const MIN_PATH_LENGTH_FOR_AUTOSTOP = 10; // Minimum number of points needed befo
 // Path trimming constants
 const TRIM_MIN_PATH_LENGTH = 5; // Min points needed to attempt trimming
 const TRIM_WINDOW_SIZE = 4;      // How many points to average over
-const TRIM_VARIANCE_THRESHOLD = 0.0001; // Threshold for variance detection (needs tuning)
+const TRIM_VARIANCE_THRESHOLD = 0.00001; // Threshold for variance detection (needs tuning)
 
 // Local storage key for saving collected data
 const LOCAL_STORAGE_KEY = 'airboard_collected_data';
@@ -1054,12 +1054,12 @@ const HandTracker: React.FC = () => {
             <p className="text-lg text-gray-300">Loading hand tracking model...</p>
           </div>
         ) : (
-          <div className="relative aspect-video mx-auto">
+          <div className="relative mx-auto">
             <video 
               ref={videoRef}
               autoPlay 
               playsInline
-              className="w-full h-full block rounded-md"
+              className="w-full h-full block"
               style={{ 
                 transform: 'scaleX(-1)', // Mirror horizontally
                 display: webcamRunning ? 'block' : 'none'
@@ -1067,7 +1067,7 @@ const HandTracker: React.FC = () => {
             />
             <canvas
               ref={canvasRef}
-              className="absolute top-0 left-0 w-full h-full block rounded-md"
+              className="absolute top-0 left-0 w-full h-full block"
               style={{
                 transform: 'scaleX(-1)', // Mirror to match video
                 display: webcamRunning ? 'block' : 'none'
