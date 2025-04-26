@@ -6,7 +6,8 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "next lint"
+    "lint": "next lint",
+    "dev:backend": "/Users/chamaththiwanka/Desktop/Projects/start_airboard_backend.sh"
   },
   "dependencies": {
     "@heroicons/react": "^2.2.0",

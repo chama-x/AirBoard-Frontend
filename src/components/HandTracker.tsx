@@ -14,7 +14,7 @@ const MEASUREMENT_NOISE_R = 0.2; // Measurement noise - how much we expect the m
 const INITIAL_COVARIANCE_P = 1.0; // Initial state covariance - higher means less trust in initial state
 const DT = 1/30; // Time delta between frames in seconds - 30 FPS assumption
 const VELOCITY_STOP_THRESHOLD = 0.08; // Velocity threshold for auto-stopping recording (needs tuning)
-const STOP_DURATION_MS = 300; // ms - Time speed must be below threshold to stop (needs tuning)
+const STOP_DURATION_MS = 500; // ms - Time speed must be below threshold to stop (needs tuning)
 const MIN_PATH_LENGTH_FOR_AUTOSTOP = 10; // Minimum number of points needed before auto-stop can activate
 
 // Path trimming constants
@@ -24,6 +24,8 @@ const TRIM_VARIANCE_THRESHOLD = 0.00001; // Threshold for variance detection (ne
 
 // Local storage key for saving collected data
 const LOCAL_STORAGE_KEY = 'airboard_collected_data';
+const TARGET_SAMPLES_PER_DIGIT = 50;
+const NUM_CLASSES = 10;
 
 /**
  * 2D Kalman Filter for smoothing finger tip trajectories
@@ -476,112 +478,71 @@ const HandTracker: React.FC = () => {
       // Add drawing connectors if needed (e.g., using HandLandmarker.HAND_CONNECTIONS)
   };
 
-  // --- Fetch Next Digit Prompt ---
-  const fetchNextDigitPrompt = async () => {
+  // Helper function to determine the next digit based on localStorage counts
+  const determineNextDigit = (): number => {
+    console.log("Determining next digit locally..."); 
+    const labelCounts: Record<number, number> = {};
+    for (let i = 0; i < NUM_CLASSES; i++) { labelCounts[i] = 0; }
+
     try {
-      // Try to fetch from backend directly (now that CORS is implemented on backend)
-      try {
-        // Use direct backend URL
-        const backendUrl = 'http://localhost:8000/next_digit_prompt';
-        console.log("Attempting to fetch digit prompt from backend:", backendUrl);
-        
-        const response = await fetch(backendUrl, {
-          method: 'GET',
-          headers: {
-            'Accept': 'application/json',
-          },
-          // Use longer timeout
-          signal: AbortSignal.timeout(5000) // 5 second timeout
-        });
-        
-        console.log("Fetch response status:", response.status);
-        
-        if (response.ok) {
-          const responseText = await response.text();
-          console.log("Raw response:", responseText);
-          
-          try {
-            const data = JSON.parse(responseText);
-            console.log("Parsed data:", data);
-            
-            if (data && data.digit_to_draw !== undefined) {
-              console.log("Successfully received prompt to draw digit:", data.digit_to_draw);
-              setDigitToDraw(data.digit_to_draw);
-              return; // Successfully got digit from backend
+      const dataString = localStorage.getItem(LOCAL_STORAGE_KEY);
+      if (dataString) {
+        // Type assertion needed as stored data has {label, path}
+        const storedData: { label: number, path: Point[] }[] = JSON.parse(dataString); 
+        if (Array.isArray(storedData)) {
+          storedData.forEach(item => {
+            // Validate label before counting
+            if (typeof item.label === 'number' && item.label >= 0 && item.label < NUM_CLASSES) {
+              labelCounts[item.label]++;
             } else {
-              console.warn("Response missing digit_to_draw:", data);
-              throw new Error("Invalid response format");
+               console.warn(`Invalid label found in localStorage data: ${item.label}`);
             }
-          } catch (parseError) {
-            console.error("Error parsing JSON:", parseError, "Raw text:", responseText);
-            throw new Error("Failed to parse JSON response");
-          }
-        } else {
-          console.warn(`Server responded with status: ${response.status}`);
-          throw new Error(`HTTP error! status: ${response.status}`);
-        }
-      } catch (fetchError) {
-        console.error("Fetch error details:", fetchError);
-        
-        // Try a direct XMLHttpRequest as fallback also directly to backend
-        try {
-          console.log("Trying XMLHttpRequest as fallback...");
-          const digit = await new Promise<number>((resolve, reject) => {
-            const xhr = new XMLHttpRequest();
-            xhr.open('GET', 'http://localhost:8000/next_digit_prompt');
-            xhr.setRequestHeader('Accept', 'application/json');
-            xhr.timeout = 5000; // 5 second timeout
-            
-            xhr.onload = function() {
-              if (xhr.status === 200) {
-                try {
-                  const data = JSON.parse(xhr.responseText);
-                  if (data && data.digit_to_draw !== undefined) {
-                    resolve(data.digit_to_draw);
-                  } else {
-                    reject(new Error("Invalid response format"));
-                  }
-                } catch (parseError: unknown) {
-                  const errorMessage = parseError instanceof Error ? parseError.message : String(parseError);
-                  reject(new Error(`Failed to parse response: ${errorMessage}`));
-                }
-              } else {
-                reject(new Error(`XHR error, status: ${xhr.status}`));
-              }
-            };
-            
-            xhr.onerror = function() {
-              reject(new Error("XHR network error"));
-            };
-            
-            xhr.ontimeout = function() {
-              reject(new Error("XHR request timed out"));
-            };
-            
-            xhr.send();
           });
-          
-          console.log("XHR success, got digit:", digit);
-          setDigitToDraw(digit);
-          return;
-        } catch (xhrError) {
-          console.warn("XMLHttpRequest also failed:", xhrError);
-          
-          // Fall back to random digit
-          console.warn("All backend requests failed, using local fallback");
-          const randomDigit = Math.floor(Math.random() * 10);
-          console.log("Using locally generated random digit:", randomDigit);
-          setDigitToDraw(randomDigit);
+        } else {
+           console.warn("Data in localStorage was not an array.");
         }
       }
-    } catch (error) {
-      console.error("Unhandled error in fetchNextDigitPrompt:", error);
-      // Last resort fallback
-      const emergencyDigit = Math.floor(Math.random() * 10);
-      console.log("Emergency fallback - using random digit:", emergencyDigit);
-      setDigitToDraw(emergencyDigit);
+    } catch (e) {
+       console.error("Error reading or parsing localStorage for counts:", e);
+       // Fallback: suggest random digit if counts can't be read
+       return Math.floor(Math.random() * NUM_CLASSES);
     }
+    
+    console.log(`Local counts: ${JSON.stringify(labelCounts)}`);
+
+    // Find digits below target count
+    const belowTargetDigits = Object.entries(labelCounts)
+                              // eslint-disable-next-line @typescript-eslint/no-unused-vars
+                              .filter(([_, count]) => count < TARGET_SAMPLES_PER_DIGIT)
+                              .map(([label, count]) => ({ label: parseInt(label), count }));
+
+    if (belowTargetDigits.length === 0) {
+      console.log(`All digits have at least ${TARGET_SAMPLES_PER_DIGIT} samples. Suggesting random digit.`);
+      // All digits met target, return random digit
+      return Math.floor(Math.random() * NUM_CLASSES);
+    }
+
+    // Find min count among those below target
+    const minCountBelowTarget = Math.min(...belowTargetDigits.map(d => d.count));
+
+    // Find all digits with that minimum count
+    const digitsToPrompt = belowTargetDigits
+                          .filter(d => d.count === minCountBelowTarget)
+                          .map(d => d.label);
+
+    // Randomly choose one
+    const chosenDigit = digitsToPrompt[Math.floor(Math.random() * digitsToPrompt.length)];
+
+    console.log(`Digits below target: ${belowTargetDigits.length}. Min count: ${minCountBelowTarget}. Prompting for: ${chosenDigit}`);
+    return chosenDigit;
   };
+  
+  // Define a function to fetch the next digit
+  const fetchNextDigit = useCallback(() => {
+    console.log("Determining next digit locally...");
+    const nextDigit = determineNextDigit();
+    setDigitToDraw(nextDigit);
+  }, []);
 
   // --- WebSocket Connection Management ---
   useEffect(() => {
@@ -595,7 +556,9 @@ const HandTracker: React.FC = () => {
       console.log('WebSocket connection established.');
       setWsStatus('connected');
       setWs(socket);
-      fetchNextDigitPrompt(); // Fetch initial prompt when connected
+      // Instead of fetchNextDigitPrompt, use local determination
+      const initialDigit = determineNextDigit();
+      setDigitToDraw(initialDigit);
     };
 
     socket.onmessage = (event) => {
@@ -691,7 +654,7 @@ const HandTracker: React.FC = () => {
          return;
     }
     
-    console.log(`Submitting path for prompted label: ${digitToDraw}`);
+    console.log(`Submitting path for prompted digit: ${digitToDraw}`);
     
     // --- Start of Local Storage Logic ---
     try {
@@ -727,17 +690,23 @@ const HandTracker: React.FC = () => {
         localStorage.setItem(LOCAL_STORAGE_KEY, updatedDataString);
         console.log(`Drawing for digit ${digitToDraw} saved locally. Total samples: ${dataArray.length}`);
 
+        // 7. Automatically determine the next digit after successful save
+        setTimeout(() => {
+          fetchNextDigit();
+        }, 1000); // Small delay for better UX
+
     } catch (error) {
         console.error("Error saving data to localStorage:", error);
-        // Handle potential errors like quota exceeded
-        alert("Error saving data locally. Local storage might be full.");
+        // Handle error, still try to fetch next digit
+        setTimeout(() => {
+          fetchNextDigit();
+        }, 1000);
     }
-    // --- End of Local Storage Logic ---
     
     // Try to send via WebSocket if available (can be disabled if not needed)
     if (ws && ws.readyState === WebSocket.OPEN) {
       try {
-          const dataToSend = JSON.stringify({ path: pathToSend, label: digitToDraw }); // Use digitToDraw state
+          const dataToSend = JSON.stringify({ path: pathToSend, label: digitToDraw });
           ws.send(dataToSend);
           console.log("Drawing path also sent via WebSocket.");
       } catch (error) {
@@ -747,11 +716,13 @@ const HandTracker: React.FC = () => {
         console.warn("WebSocket not open, skipping send but data was saved locally.");
     }
     
-    // Reset state after submission attempt
-    setCurrentPath([]); // Clear visual path
-    setDigitToDraw(null); // Clear prompt, require user action for next one
-    // Prediction state (setPredictedDigit) will be updated by onmessage handler
-  }, [digitToDraw, ws, setCurrentPath, setDigitToDraw]);
+    // Reset current path and prediction, but not digitToDraw yet
+    // (that will happen after fetching the next digit)
+    setCurrentPath([]);
+    setPredictedDigit(null);
+    setPredictionConfidence(null);
+    
+  }, [digitToDraw, setCurrentPath, setDigitToDraw, fetchNextDigit]);
 
   const handleStopDrawing = useCallback(() => {
     if (!isRecording || digitToDraw === null) return; // Check digitToDraw too
@@ -784,13 +755,13 @@ const HandTracker: React.FC = () => {
     } else {
         console.log("Path too short, skipping submission.");
         setCurrentPath([]); // Clear visual path if too short
-        setDigitToDraw(null); // Clear prompt to force user to get next one
+        fetchNextDigit(); // Still fetch next digit
     }
     
     // Reset Kalman filter after submission
     kalmanFilterRef.current = null;
-  }, [isRecording, digitToDraw, currentPath, submitDrawing]);
-  
+  }, [isRecording, digitToDraw, currentPath, submitDrawing, fetchNextDigit]);
+
   const handleStartDrawing = useCallback(() => {
     if (!webcamRunning || digitToDraw === null) return; // Don't start if no prompt
     console.log(`Starting path recording for digit: ${digitToDraw}...`);
@@ -981,6 +952,11 @@ const HandTracker: React.FC = () => {
           if (videoRef.current) {
               videoRef.current.srcObject = stream;
               videoRef.current.play();
+              
+              // After webcam is enabled, determine first digit locally
+              console.log("Webcam enabled, determining first digit...");
+              const firstDigit = determineNextDigit();
+              setDigitToDraw(firstDigit);
           }
       } catch (err) {
           console.error("ERROR: getUserMedia() error:", err);
@@ -1033,12 +1009,10 @@ const HandTracker: React.FC = () => {
               </p>
             ) : (
               webcamRunning ? (
-                <button 
-                  onClick={fetchNextDigitPrompt} 
-                  className="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-md font-semibold transition duration-150 ease-in-out focus:outline-hidden focus:ring-3 focus:ring-offset-2 focus:ring-offset-gray-800 focus:ring-blue-500"
-                >
-                  Get Next Digit
-                </button>
+                <div className="flex flex-col items-center">
+                  <div className="inline-block animate-spin rounded-full h-8 w-8 border-t-2 border-b-2 border-blue-500 mb-2"></div>
+                  <p className="text-gray-400">Fetching next digit...</p>
+                </div>
               ) : (
                 <p className="text-lg text-gray-400 p-2">
                   Enable webcam to start.
@@ -1157,10 +1131,11 @@ const HandTracker: React.FC = () => {
           <h4 className="text-lg font-medium mb-4 text-gray-300">How to Use</h4>
           <ol className="list-decimal list-inside space-y-2 text-gray-400">
             <li>Enable your webcam</li>
-            <li>Click &quot;Get Next Digit&quot; to receive a prompt</li>
+            <li>Wait for a digit prompt to appear</li>
             <li>Position your index finger in view of the camera</li>
             <li>Click &quot;Start Drawing&quot; and draw the prompted digit in the air</li>
             <li>Drawing will auto-stop when you finish, or click &quot;Stop Drawing&quot;</li>
+            <li>After each drawing, a new digit will be automatically prompted</li>
           </ol>
           
           <div className="mt-6 p-4 bg-gray-900 rounded-md">
@@ -1170,6 +1145,7 @@ const HandTracker: React.FC = () => {
               <li>Keep your hand in the camera view at all times</li>
               <li>Position yourself in good lighting</li>
               <li>Hold your position after drawing for automatic stopping</li>
+              <li>After completing all 10 digits, view your data in the Data Manager</li>
             </ul>
           </div>
         </div>

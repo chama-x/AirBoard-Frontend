@@ -1,29 +1,35 @@
 @import "tailwindcss";
 
+@theme {
+  /* Batman Theme Colors defined as Tailwind v4 theme tokens */
+  /* These will generate utilities like bg-background, text-surface, etc. */
+  /* And also standard CSS variables like var(--color-background) */
+  --color-background: #000000;       /* Dark Knight Black */
+  --color-surface: #232834;         /* Gotham Gray */
+  --color-border: #36454F;           /* Shadowy Charcoal */
+  --color-primary-accent: #FFD700;    /* Batarang Gold */
+  --color-secondary-accent: #BA8E23;  /* Dark Yellow */
+  --color-optional-accent: #003366;   /* Batman Blue */
+  --color-text-primary: #E0E0E0;       /* Light Gray */
+  --color-text-titles: #F8F805;         /* Soft Yellow */
 
-/* Keep any other custom CSS you might have */
-
-:root {
-  --background: #ffffff;
-  --foreground: #171717;
-}
-
-@theme inline {
-  --color-background: var(--background);
-  --color-foreground: var(--foreground);
+  /* If you need to override other default theme aspects (e.g., spacing, fonts), */
+  /* you would add them here using their respective namespaces (--spacing-*, --font-*) */
   --font-sans: var(--font-geist-sans);
   --font-mono: var(--font-geist-mono);
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
+/* Optional: Apply base background/text color globally using standard CSS vars */
+/* These vars (e.g., var(--color-background)) are automatically created by Tailwind */
+/* from the @theme definitions above. */
+@layer base {
+  body {
+    background-color: var(--color-background);
+    color: var(--color-text-primary);
+    font-family: Arial, Helvetica, sans-serif;
   }
-}
-
-body {
-  background: var(--background);
-  color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+  /* Add other base element styles here if needed */
+  h1, h2, h3, h4, h5, h6 {
+     color: var(--color-text-titles);
+  }
 }

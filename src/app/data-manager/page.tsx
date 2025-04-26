@@ -1,7 +1,7 @@
 "use client";
 
-import { useState, useEffect, useRef } from "react";
-import { TrashIcon, CheckIcon } from "@heroicons/react/24/outline";
+import { useState, useEffect, useRef, useMemo } from "react";
+import { TrashIcon, CheckIcon, ArrowDownTrayIcon } from "@heroicons/react/24/outline";
 
 // Define the correct storage key
 const LOCAL_STORAGE_KEY = 'airboard_collected_data';
@@ -180,6 +180,51 @@ export default function DataManager() {
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [isLoading, setIsLoading] = useState(true);
 
+  // Calculate statistics
+  const { totalCount, countsPerLabel } = useMemo(() => {
+    const counts: Record<number, number> = {};
+    // Initialize counts for all digits 0-9
+    for (let i = 0; i <= 9; i++) { 
+      counts[i] = 0; 
+    }
+    
+    // Count occurrences
+    drawings.forEach(drawing => {
+      if (counts[drawing.label] !== undefined) {
+        counts[drawing.label]++;
+      }
+    });
+    
+    return {
+      totalCount: drawings.length,
+      countsPerLabel: counts
+    };
+  }, [drawings]);
+
+  // Group drawings by label
+  const groupedDrawings = useMemo(() => {
+    const groups: Record<number, DrawingData[]> = {};
+    
+    // Initialize empty arrays for all digits 0-9
+    for (let i = 0; i <= 9; i++) {
+      groups[i] = [];
+    }
+    
+    // Group drawings by their label
+    drawings.forEach(drawing => {
+      if (drawing.label >= 0 && drawing.label <= 9) {
+        groups[drawing.label].push(drawing);
+      }
+    });
+    
+    // Sort drawings within each group by timestamp (newest first)
+    for (const label in groups) {
+      groups[label].sort((a, b) => b.timestamp - a.timestamp);
+    }
+    
+    return groups;
+  }, [drawings]);
+
   // Load drawings from localStorage
   useEffect(() => {
     setIsLoading(true);
@@ -283,9 +328,72 @@ export default function DataManager() {
     setSelectedIds(new Set());
   };
 
+  // Export drawings as JSON
+  const handleExportJson = () => {
+    if (drawings.length === 0) {
+      alert("No data available to export.");
+      return;
+    }
+
+    try {
+      // 1. Map data back to the {label, path} format
+      const dataToExport = drawings.map(d => ({
+        label: d.label,
+        path: d.points // Map 'points' back to 'path' for export consistency
+      }));
+
+      // 2. Convert to JSON string (pretty printed)
+      const jsonString = JSON.stringify(dataToExport, null, 2);
+
+      // 3. Create a Blob
+      const blob = new Blob([jsonString], { type: 'application/json' });
+
+      // 4. Create a temporary URL
+      const url = URL.createObjectURL(blob);
+
+      // 5. Create a temporary link element to trigger download
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = `airboard_data_${new Date().toISOString().split('T')[0]}.json`; // e.g., airboard_data_2025-04-26.json
+      link.style.display = 'none'; // Hide the link
+
+      // 6. Append, click, and remove the link
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+
+      // 7. Revoke the temporary URL
+      URL.revokeObjectURL(url);
+
+      console.log(`Exported ${dataToExport.length} drawings to JSON.`);
+
+    } catch (error) {
+      console.error("Error exporting data:", error);
+      alert("An error occurred while exporting the data.");
+    }
+  };
+
   return (
     <div className="container mx-auto p-4 max-w-6xl">
-      <h1 className="text-2xl font-bold mb-6">Drawing Data Manager</h1>
+      <h1 className="text-2xl font-bold mb-4">Drawing Data Manager</h1>
+      
+      {/* Statistics Section */}
+      <div className="mb-6 p-4 bg-gray-800 rounded-lg">
+        <h2 className="text-xl font-semibold text-white mb-3">Statistics</h2>
+        <p className="text-gray-200 mb-2">Total Drawings: <span className="font-semibold">{totalCount}</span></p>
+        
+        <div className="mt-3">
+          <h3 className="text-sm font-medium text-gray-300 mb-2">Count per digit:</h3>
+          <div className="grid grid-cols-5 gap-3 md:grid-cols-10">
+            {Object.entries(countsPerLabel).map(([label, count]) => (
+              <div key={label} className="bg-gray-700 rounded-lg p-3 text-center">
+                <span className="text-xl font-bold text-white block">{label}</span>
+                <span className="text-sm text-gray-300">{count} drawings</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      </div>
       
       {/* Action buttons */}
       <div className="flex justify-between mb-6">
@@ -303,6 +411,14 @@ export default function DataManager() {
             disabled={selectedIds.size === 0}
           >
             Clear Selection
+          </button>
+          <button
+            onClick={handleExportJson}
+            className="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-sm flex items-center gap-2"
+            disabled={drawings.length === 0}
+          >
+            <ArrowDownTrayIcon className="w-5 h-5" />
+            Export as JSON ({drawings.length})
           </button>
         </div>
         
@@ -331,17 +447,34 @@ export default function DataManager() {
         </div>
       )}
       
-      {/* Drawings grid */}
+      {/* Drawings grouped by digit */}
       {!isLoading && drawings.length > 0 && (
-        <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 gap-4">
-          {drawings.map(drawing => (
-            <PathThumbnail
-              key={drawing.id}
-              drawing={drawing}
-              isSelected={selectedIds.has(drawing.id)}
-              onClick={() => toggleSelection(drawing.id)}
-            />
-          ))}
+        <div className="space-y-8">
+          {Array.from({ length: 10 }, (_, i) => i).map(digit => {
+            const digitDrawings = groupedDrawings[digit];
+            
+            // Skip rendering sections with no drawings
+            if (!digitDrawings || digitDrawings.length === 0) return null;
+            
+            return (
+              <div key={digit} className="pt-4">
+                <h3 className="text-xl font-semibold mb-4 border-b border-gray-700 pb-2">
+                  Digit: {digit} <span className="text-gray-400 text-base">({countsPerLabel[digit]} drawings)</span>
+                </h3>
+                
+                <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 gap-4">
+                  {digitDrawings.map(drawing => (
+                    <PathThumbnail
+                      key={drawing.id}
+                      drawing={drawing}
+                      isSelected={selectedIds.has(drawing.id)}
+                      onClick={() => toggleSelection(drawing.id)}
+                    />
+                  ))}
+                </div>
+              </div>
+            );
+          })}
         </div>
       )}
     </div>
