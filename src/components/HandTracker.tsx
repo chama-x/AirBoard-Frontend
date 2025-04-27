@@ -1446,7 +1446,7 @@ const HandTracker: React.FC = () => {
               } else {
                 rawVelocityMagnitude = Math.sqrt(vx * vx + vy * vy + vz * vz);
                 
-                // Cap unreasonable velocities (more than 5 meters per second)
+                // Cap unreasonable velocities
                 const MAX_REASONABLE_VELOCITY = 3.0; // 3.0 units in normalized space
                 if (rawVelocityMagnitude > MAX_REASONABLE_VELOCITY) {
                   const scale = MAX_REASONABLE_VELOCITY / rawVelocityMagnitude;
@@ -1544,19 +1544,27 @@ const HandTracker: React.FC = () => {
                   }
                   break;
                   
-                case 'DRAWING':
-                  // Add point to current stroke
-                  currentStrokeRef.current.push(filteredPoint);
-                  
-                  // Check for pause condition provided by PauseDetector
+                case 'DRAWING': { // Use block scope
+                  // 1. Check for pause condition FIRST
+                  const currentTimeMs = filteredPoint.t; // Assuming filteredPoint.t is ms
+                  const isCurrentlyPaused = deps.pauseDetector.isPaused(currentTimeMs);
+                  console.log('Tracking Loop - isPaused() returned:', isCurrentlyPaused);
+
                   if (isCurrentlyPaused) {
+                    // If paused, finalize the segment and transition state
                     console.log(`State Change: DRAWING -> PAUSED (Pause Detector Returned True)`);
-                    deps.setDrawingPhase('PAUSED'); // Transition to PAUSED
-                    // Call finalize with the copied stroke data
-                    deps.finalizeAndProcessSegment([...currentStrokeRef.current]);
-                    return;
+                    deps.setDrawingPhase('PAUSED');
+                    deps.finalizeAndProcessSegment([...currentStrokeRef.current]); // Finalize with points collected *before* this frame
+                    // currentStrokeRef is cleared inside finalizeAndProcessSegment
+                    return; // Exit the renderLoop for this frame
                   }
+
+                  // 2. Only push point if NOT paused
+                  currentStrokeRef.current.push(filteredPoint);
+
+                  // 3. Break normally if not paused
                   break;
+                }
                   
                 case 'PAUSED':
                 case 'SEGMENTING': // Treat PAUSED and SEGMENTING similarly
