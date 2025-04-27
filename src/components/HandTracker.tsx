@@ -351,7 +351,9 @@ function matrixInverse2x2(m: number[][]): number[][] {
  * Trim noisy tail segments from the drawing path based on positional variance
  * @param path The recorded path of points
  * @returns Trimmed path with noisy tail removed
+ * @deprecated No longer used with the session-based model
  */
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
 const trimNoisyTail = (path: Point[]): Point[] => {
   // If path is too short, return as is
   if (path.length < TRIM_MIN_PATH_LENGTH) {
@@ -477,7 +479,7 @@ const HandTracker: React.FC = () => {
   const [webcamRunning, setWebcamRunning] = useState<boolean>(false);
   const [loading, setLoading] = useState<boolean>(true);
   const [latestResults, setLatestResults] = useState<HandLandmarkerResult | null>(null);
-  const [isRecording, setIsRecording] = useState<boolean>(false);
+  const [isSessionActive, setIsSessionActive] = useState<boolean>(false);
   const [currentPath, setCurrentPath] = useState<Point[]>([]);
   const [digitToDraw, setDigitToDraw] = useState<number | null>(null);
   const [ws, setWs] = useState<WebSocket | null>(null);
@@ -596,8 +598,112 @@ const HandTracker: React.FC = () => {
     return chosenDigit;
   };
   
-  // Function to finalize and process a completed segment
-  const finalizeAndProcessSegment = (segmentPoints: Array<{ x: number; y: number; z?: number; t: number }>) => {
+  // First, declare fetchNextDigit early since it's used in submitDrawing
+  const fetchNextDigit = useCallback(() => {
+    console.log("Determining next digit locally...");
+    const nextDigit = determineNextDigit();
+    setDigitToDraw(nextDigit);
+  }, []);
+
+  // Then define submitDrawing
+  const submitDrawing = useCallback((pathToSend: Point[]) => { // Takes path as argument
+    if (isTrainingMode && (digitToDraw === null || !pathToSend || pathToSend.length < 2)) {
+         console.warn("Cannot submit drawing - no prompted digit or invalid path.");
+         // Reset state partially?
+         setCurrentPath([]);
+         setDigitToDraw(null); // Force fetch next
+         return;
+    }
+    
+    // In training mode, save the data to localStorage
+    if (isTrainingMode) {
+      console.log(`Submitting path for prompted digit: ${digitToDraw}`);
+      
+      // --- Start of Local Storage Logic ---
+      try {
+          // 1. Get existing data string from localStorage
+          const existingDataString = localStorage.getItem(LOCAL_STORAGE_KEY);
+
+          // 2. Parse existing data (or initialize if none)
+          let dataArray: { label: number, path: Point[] }[] = [];
+          if (existingDataString) {
+              try {
+                  dataArray = JSON.parse(existingDataString);
+                  if (!Array.isArray(dataArray)) { // Basic validation
+                    console.warn("Invalid data found in localStorage, resetting.");
+                    dataArray = [];
+                  }
+              } catch (parseError) {
+                  console.error("Error parsing data from localStorage:", parseError);
+                  // Optionally reset if parsing fails
+                  dataArray = []; 
+              }
+          }
+
+          // 3. Create new entry
+          if (digitToDraw !== null) {
+            const newEntry = { label: digitToDraw, path: pathToSend };
+
+            // 4. Append new entry
+            dataArray.push(newEntry);
+
+            // 5. Stringify updated array
+            const updatedDataString = JSON.stringify(dataArray);
+
+            // 6. Save back to localStorage
+            localStorage.setItem(LOCAL_STORAGE_KEY, updatedDataString);
+            console.log(`Drawing for digit ${digitToDraw} saved locally. Total samples: ${dataArray.length}`);
+
+            // 7. Automatically determine the next digit after successful save
+            setTimeout(() => {
+              fetchNextDigit();
+            }, 1000); // Small delay for better UX
+          }
+      } catch (error) {
+          console.error("Error saving data to localStorage:", error);
+          // Handle error, still try to fetch next digit
+          setTimeout(() => {
+            fetchNextDigit();
+          }, 1000);
+      }
+      
+      // Try to send to WebSocket if available (for training data collection)
+      if (ws && ws.readyState === WebSocket.OPEN && digitToDraw !== null) {
+        try {
+            const dataToSend = JSON.stringify({ path: pathToSend, label: digitToDraw });
+            ws.send(dataToSend);
+            console.log("Drawing path also sent via WebSocket for training.");
+        } catch (error) {
+            console.error("Error sending drawing path via WebSocket:", error);
+        }
+      } else {
+          console.warn("WebSocket not open, skipping send but data was saved locally.");
+      }
+    } else {
+      // In prediction mode, just send the drawing for prediction via WebSocket
+      // (this code is handling the case where submitDrawing is called directly in prediction mode)
+      if (ws && ws.readyState === WebSocket.OPEN && pathToSend.length > 1) {
+        try {
+          const dataToSend = JSON.stringify({ path: pathToSend });
+          ws.send(dataToSend);
+          console.log("Sent path data for prediction:", pathToSend.length, "points");
+        } catch (error) {
+          console.error("Error sending drawing path for prediction:", error);
+        }
+      }
+    }
+    
+    // Reset current path and prediction for both modes
+    setCurrentPath([]);
+    setPredictedDigit(null);
+    setPredictionConfidence(null);
+    
+  }, [digitToDraw, setCurrentPath, setDigitToDraw, fetchNextDigit, ws, isTrainingMode]);
+
+  // Now define finalizeAndProcessSegment which uses submitDrawing
+  const finalizeAndProcessSegment = useCallback((segmentPoints: Array<{ x: number; y: number; z?: number; t: number }>) => {
+    console.log("Finalizing Segment. Current isSessionActive:", isSessionActive);
+    
     // Check if segment has enough points
     if (segmentPoints.length < MIN_SEGMENT_LENGTH) {
       console.log(`Segment too short (${segmentPoints.length} points), ignoring.`);
@@ -616,7 +722,7 @@ const HandTracker: React.FC = () => {
       y: p.y - firstPoint.y,
       z: p.z !== undefined ? p.z - (firstPoint.z ?? 0) : undefined
     }));
-
+    
     // Format the processed segment for prediction or saving
     if (isTrainingMode) {
       // In training mode, save the segment with the current digit label
@@ -642,14 +748,27 @@ const HandTracker: React.FC = () => {
     
     // Clear current path for visualization
     setCurrentPath([]);
-  };
-  
-  // Define a function to fetch the next digit
-  const fetchNextDigit = useCallback(() => {
-    console.log("Determining next digit locally...");
-    const nextDigit = determineNextDigit();
-    setDigitToDraw(nextDigit);
-  }, []);
+    
+    // Don't end the session - just clear the current segment ref to start a new segment
+    currentSegmentRef.current = [];
+    
+    // Reset pause state after segment processing
+    isPausedRef.current = false;
+    pauseStartTimeRef.current = null;
+    console.log("Segment finalized, pause state reset.");
+  }, [
+    isSessionActive,
+    isTrainingMode,
+    digitToDraw,
+    setCompletedSegments,
+    setCurrentPath,
+    setPrediction,
+    ws,
+    submitDrawing,
+    isPausedRef,
+    pauseStartTimeRef,
+    currentSegmentRef
+  ]);
 
   // --- WebSocket Connection Management ---
   useEffect(() => {
@@ -774,174 +893,25 @@ const HandTracker: React.FC = () => {
   }, []);
 
   // --- Drawing Controls ---
-  const submitDrawing = useCallback((pathToSend: Point[]) => { // Takes path as argument
-    if (isTrainingMode && (digitToDraw === null || !pathToSend || pathToSend.length < 2)) {
-         console.warn("Cannot submit drawing - no prompted digit or invalid path.");
-         // Reset state partially?
-         setCurrentPath([]);
-         setDigitToDraw(null); // Force fetch next
-         return;
-    }
-    
-    // In training mode, save the data to localStorage
-    if (isTrainingMode) {
-      console.log(`Submitting path for prompted digit: ${digitToDraw}`);
-      
-      // --- Start of Local Storage Logic ---
-      try {
-          // 1. Get existing data string from localStorage
-          const existingDataString = localStorage.getItem(LOCAL_STORAGE_KEY);
-
-          // 2. Parse existing data (or initialize if none)
-          let dataArray: { label: number, path: Point[] }[] = [];
-          if (existingDataString) {
-              try {
-                  dataArray = JSON.parse(existingDataString);
-                  if (!Array.isArray(dataArray)) { // Basic validation
-                    console.warn("Invalid data found in localStorage, resetting.");
-                    dataArray = [];
-                  }
-              } catch (parseError) {
-                  console.error("Error parsing data from localStorage:", parseError);
-                  // Optionally reset if parsing fails
-                  dataArray = []; 
-              }
-          }
-
-          // 3. Create new entry
-          if (digitToDraw !== null) {
-            const newEntry = { label: digitToDraw, path: pathToSend };
-
-            // 4. Append new entry
-            dataArray.push(newEntry);
-
-            // 5. Stringify updated array
-            const updatedDataString = JSON.stringify(dataArray);
-
-            // 6. Save back to localStorage
-            localStorage.setItem(LOCAL_STORAGE_KEY, updatedDataString);
-            console.log(`Drawing for digit ${digitToDraw} saved locally. Total samples: ${dataArray.length}`);
-
-            // 7. Automatically determine the next digit after successful save
-            setTimeout(() => {
-              fetchNextDigit();
-            }, 1000); // Small delay for better UX
-          }
-      } catch (error) {
-          console.error("Error saving data to localStorage:", error);
-          // Handle error, still try to fetch next digit
-          setTimeout(() => {
-            fetchNextDigit();
-          }, 1000);
-      }
-      
-      // Try to send to WebSocket if available (for training data collection)
-      if (ws && ws.readyState === WebSocket.OPEN && digitToDraw !== null) {
-        try {
-            const dataToSend = JSON.stringify({ path: pathToSend, label: digitToDraw });
-            ws.send(dataToSend);
-            console.log("Drawing path also sent via WebSocket for training.");
-        } catch (error) {
-            console.error("Error sending drawing path via WebSocket:", error);
-        }
-      } else {
-          console.warn("WebSocket not open, skipping send but data was saved locally.");
-      }
-    } else {
-      // In prediction mode, just send the drawing for prediction via WebSocket
-      // (this code is handling the case where submitDrawing is called directly in prediction mode)
-      if (ws && ws.readyState === WebSocket.OPEN && pathToSend.length > 1) {
-        try {
-          const dataToSend = JSON.stringify({ path: pathToSend });
-          ws.send(dataToSend);
-          console.log("Sent path data for prediction:", pathToSend.length, "points");
-        } catch (error) {
-          console.error("Error sending drawing path for prediction:", error);
-        }
-      }
-    }
-    
-    // Reset current path and prediction for both modes
-    setCurrentPath([]);
-    setPredictedDigit(null);
-    setPredictionConfidence(null);
-    
-  }, [digitToDraw, setCurrentPath, setDigitToDraw, fetchNextDigit, ws, isTrainingMode]);
-
-  const handleStopDrawing = useCallback(() => {
-    if (!isRecording) return; 
-    console.log(`Stopping path recording...`);
-    setIsRecording(false);
-    // Reset threshold timer
-    timeBelowThresholdStartRef.current = null;
-
-    const rawPath = [...currentPath];
-    
-    // Apply path trimming to remove noisy tail segments
-    const trimmedPath = trimNoisyTail(rawPath);
-    console.log(`Path trimming: Original=${rawPath.length}, Trimmed=${trimmedPath.length}`);
-    
-    // Use the Kalman-filtered and trimmed path
-    const filteredPath = trimmedPath;
-
-    console.log("Path Recorded (Points):", rawPath.length);
-    console.log("Kalman Filtered & Trimmed Path (Points):", filteredPath.length);
-
-    if (filteredPath.length > 1) {
-      if (isTrainingMode) {
-        // Training mode - save data with label
-        if (digitToDraw !== null) {
-          submitDrawing(filteredPath); // Call submit function with Kalman-filtered path
-        } else {
-          console.warn("Cannot submit drawing - no prompted digit.");
-          setCurrentPath([]); // Clear visual path
-        }
-      } else {
-        // Prediction mode - send to backend for prediction
-        setPrediction(null); // Clear previous prediction while waiting
-        
-        if (ws && ws.readyState === WebSocket.OPEN) {
-          try {
-            const dataToSend = JSON.stringify({ path: filteredPath });
-            ws.send(dataToSend);
-            console.log("Sent path data for prediction:", filteredPath.length, "points");
-          } catch (error) {
-            console.error("Error sending drawing path for prediction:", error);
-          }
-        } else {
-          console.warn("WebSocket not open, cannot get prediction");
-        }
-        
-        // Just clear the path in prediction mode, no need to save
-        setCurrentPath([]);
-      }
-    } else {
-      console.log("Path too short, skipping submission.");
-      setCurrentPath([]); // Clear visual path if too short
-      if (isTrainingMode && digitToDraw === null) {
-        fetchNextDigit(); // Still fetch next digit in training mode
-      }
-    }
-    
-    // Reset Kalman filter after submission
-    kalmanFilterRef.current = null;
-  }, [isRecording, digitToDraw, currentPath, submitDrawing, fetchNextDigit, ws, isTrainingMode]);
-
-  const handleStartDrawing = useCallback(() => {
+  const handleStartSession = useCallback(() => {
     if (!webcamRunning) return; // Don't start if webcam not running
     
     // In training mode, we need a digit prompt
     if (isTrainingMode && digitToDraw === null) {
-      console.warn("Cannot start recording in training mode without a digit prompt");
+      console.warn("Cannot start session in training mode without a digit prompt");
       return;
     }
     
-    console.log(`Starting path recording${isTrainingMode ? ` for digit: ${digitToDraw}` : ''}`);
-    setCurrentPath([]); // Clear previous visual path
+    console.log(`Starting drawing session${isTrainingMode ? ` for digit: ${digitToDraw}` : ''}`);
+    
+    // Reset all relevant buffers and states for a new session
+    setCurrentPath([]);
+    setCompletedSegments([]); // Reset persistent paths
     setPredictedDigit(null);
     setPredictionConfidence(null);
     setPrediction(null); // Clear any previous prediction
-    setIsRecording(true);
+    setIsSessionActive(true); // Activate the session
+    console.log("handleStartSession called: isSessionActive set to true");
     
     // Reset Kalman filter for new drawing
     kalmanFilterRef.current = null;
@@ -954,11 +924,32 @@ const HandTracker: React.FC = () => {
     prevVelocityRef.current = null;
     prevAccelRef.current = null;
     
-    // Reset threshold timer (old logic, can be removed if not used elsewhere)
+    // Reset threshold timer
     timeBelowThresholdStartRef.current = null;
+    
+    // Reset kinematic data
+    setVelocityHistory([]);
+    setAccelerationHistory([]);
+    
   }, [webcamRunning, digitToDraw, isTrainingMode]);
 
-  // Reset Drawing functionality
+  const handleEndSession = useCallback(() => {
+    if (!isSessionActive) return; 
+    console.log(`Ending drawing session...`);
+    
+    // Process the final segment if it has enough points
+    if (currentSegmentRef.current.length >= MIN_SEGMENT_LENGTH) {
+      finalizeAndProcessSegment([...currentSegmentRef.current]);
+    }
+    
+    setIsSessionActive(false);
+    console.log("handleEndSession called: isSessionActive set to false");
+    
+    // Reset Kalman filter after session ends
+    kalmanFilterRef.current = null;
+  }, [isSessionActive, finalizeAndProcessSegment]);
+
+  // Also update handleResetDrawing to stop the session
   const handleResetDrawing = useCallback(() => {
     console.log("Drawing reset.");
     setCurrentPath([]);
@@ -966,6 +957,8 @@ const HandTracker: React.FC = () => {
     setPredictedDigit(null);
     setPredictionConfidence(null);
     setCompletedSegments([]); // Clear completed segments
+    setIsSessionActive(false); // Explicitly stop the session
+    console.log("handleResetDrawing called: isSessionActive set to false");
     
     // Reset kinematic data
     setVelocityHistory([]);
@@ -984,7 +977,7 @@ const HandTracker: React.FC = () => {
     prevVelocityRef.current = null;
     prevAccelRef.current = null;
     
-    // Reset threshold timer (old logic, can be removed if not used elsewhere)
+    // Reset threshold timer
     timeBelowThresholdStartRef.current = null;
   }, []);
 
@@ -1051,16 +1044,12 @@ const HandTracker: React.FC = () => {
               t: time,       // Store current time
             };
             
-            // If we're in recording mode, process the point for path segmentation
-            if (isRecording) {
+            // If we're in a session, process the point for path segmentation
+            if (isSessionActive) {
               // Add the filtered point to the visual path for display
               setCurrentPath(prevPath => [...prevPath, { x: filteredX, y: filteredY, z: indexTip.z }]);
               
-              // Only add points to the current segment if not in a confirmed pause state
-              if (!isPausedRef.current) {
-                // Add the filtered point to the current segment (with timestamp)
-                currentSegmentRef.current.push(filteredPoint);
-              }
+              console.log(`Loop Check: isSessionActive=${isSessionActive}, isPausedRef=${isPausedRef.current}`);
               
               // Calculate velocity if we have at least two points
               if (currentSegmentRef.current.length >= 2) {
@@ -1123,6 +1112,17 @@ const HandTracker: React.FC = () => {
                   const peakSpeed = Math.max(...velocityHistoryRef.current.map(item => item.v), 0.001); // Avoid zero
                   const adaptiveVelocityThreshold = peakSpeed * ADAPTIVE_VEL_THRESHOLD_RATIO;
                   
+                  // Require speed to be definitively above threshold to buffer points
+                  const speedThresholdForBuffering = adaptiveVelocityThreshold * 1.2; // Require speed > 120% of pause threshold
+                  
+                  // MODIFIED CONDITION: Only add points if:
+                  // 1. Not paused, AND
+                  // 2. Either starting a new segment OR moving definitively above the threshold
+                  if (!isPausedRef.current && (currentSegmentRef.current.length === 0 || currentSpeed > speedThresholdForBuffering)) {
+                    // Only add filtered point to segment if it meets our criteria
+                    currentSegmentRef.current.push(filteredPoint);
+                  }
+                  
                   // Calculate acceleration if we have previous velocity - move this outside throttling
                   let currentAccelMag = 0;
                   // let currentJerkMag = 0; // Disabled jerk calculation for simplification
@@ -1155,6 +1155,7 @@ const HandTracker: React.FC = () => {
                     if (!isPausedRef.current) {
                       // Starting potential pause
                       isPausedRef.current = true;
+                      console.log("Pause Detected: isPausedRef set to true");
                       pauseStartTimeRef.current = time;
                     } else {
                       // Continuing potential pause, check duration and stability
@@ -1189,16 +1190,21 @@ const HandTracker: React.FC = () => {
                     if (isPausedRef.current) {
                       // Reset pause state if we were paused
                       isPausedRef.current = false;
+                      console.log("Movement Resumed: isPausedRef set to false");
                       pauseStartTimeRef.current = null;
                     }
                   }
                 }
+              } else {
+                // For the first two points when we don't have velocity yet
+                // Add them unconditionally to bootstrap the speed calculations
+                currentSegmentRef.current.push(filteredPoint);
               }
             }
           }
         } else {
           // No hand detected - if we've been recording, handle potential end of segment
-          if (isRecording && currentSegmentRef.current.length >= MIN_SEGMENT_LENGTH) {
+          if (isSessionActive && currentSegmentRef.current.length >= MIN_SEGMENT_LENGTH) {
             console.log('Hand lost from view - processing current segment');
             finalizeAndProcessSegment(currentSegmentRef.current);
             currentSegmentRef.current = [];
@@ -1287,7 +1293,7 @@ const HandTracker: React.FC = () => {
         cancelAnimationFrame(animationFrameId);
       }
     };
-  }, [webcamRunning, handLandmarker, latestResults, isRecording, currentPath, finalizeAndProcessSegment]); // Added finalizeAndProcessSegment, removed handleStopDrawing
+  }, [webcamRunning, handLandmarker, latestResults, isSessionActive, currentPath, finalizeAndProcessSegment]); // Updated isRecording to isSessionActive
 
   // --- Enable/Disable Webcam ---
   const enableCam = async () => {
@@ -1316,7 +1322,7 @@ const HandTracker: React.FC = () => {
 
   const disableCam = () => {
       setWebcamRunning(false); // Set state to not running
-      setIsRecording(false); // Stop recording if active
+      setIsSessionActive(false); // End any active session
       if (videoRef.current) {
           if (videoRef.current.srcObject) {
               const tracks = (videoRef.current.srcObject as MediaStream).getTracks();
@@ -1517,9 +1523,9 @@ const HandTracker: React.FC = () => {
 
           <div className="mt-6 text-center">
             <p className="text-center font-medium mb-2 text-sm text-border">
-              {isRecording ? 'Status: ' : ''}
-              <span className={isRecording ? 'text-primary-accent font-bold' : 'text-border'}>
-                {isRecording ? 'RECORDING' : ''}
+              {isSessionActive ? 'Status: ' : ''}
+              <span className={isSessionActive ? 'text-primary-accent font-bold' : 'text-border'}>
+                {isSessionActive ? 'SESSION ACTIVE' : ''}
               </span>
             </p>
             
@@ -1555,21 +1561,21 @@ const HandTracker: React.FC = () => {
         
         <div className="flex flex-col space-y-4 mb-4">
           <button 
-            onClick={handleStartDrawing} 
-            disabled={!webcamRunning || isRecording || loading || (isTrainingMode && digitToDraw === null)} 
+            onClick={handleStartSession} 
+            disabled={!webcamRunning || isSessionActive || loading || (isTrainingMode && digitToDraw === null)} 
             className="w-full px-4 py-2 bg-surface hover:bg-border text-text-primary border border-primary-accent rounded-md font-semibold transition duration-150 ease-in-out focus:outline-hidden focus:ring-3 focus:ring-offset-2 focus:ring-offset-background focus:ring-primary-accent disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-x-2"
           >
             <PlayIcon className="h-5 w-5 text-primary-accent" />
-            Start Drawing
+            Start Session
           </button>
           
           <button 
-            onClick={handleStopDrawing} 
-            disabled={!webcamRunning || !isRecording || loading} 
+            onClick={handleEndSession} 
+            disabled={!webcamRunning || !isSessionActive || loading} 
             className="w-full px-4 py-2 bg-surface hover:bg-border text-text-primary border border-secondary-accent rounded-md font-semibold transition duration-150 ease-in-out focus:outline-hidden focus:ring-3 focus:ring-offset-2 focus:ring-offset-background focus:ring-secondary-accent disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-x-2"
           >
             <StopIcon className="h-5 w-5 text-secondary-accent" />
-            Stop Drawing
+            End Session
           </button>
           
           <button 
@@ -1663,7 +1669,7 @@ const HandTracker: React.FC = () => {
                       <span className="font-medium">Paused:</span> {isPausedRef.current ? 'Yes' : 'No'}
                     </p>
                     <p className="text-text-primary">
-                      <span className="font-medium">Recording:</span> {isRecording ? 'Yes' : 'No'}
+                      <span className="font-medium">Recording:</span> {isSessionActive ? 'Yes' : 'No'}
                     </p>
                   </div>
                 </div>
