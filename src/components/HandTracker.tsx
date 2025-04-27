@@ -655,7 +655,8 @@ class PauseDetector {
   private pauseStartTime: number | null = null;
   private pauseConfirmed: boolean = false;
   private readonly config: {
-    minPauseDurationMs: number;
+    bufferSize: number;
+    minPauseDurationMicros: number;
     velocityThreshold: number;
     positionVarianceThreshold: number;
     minPointsForVariance: number;
@@ -665,9 +666,10 @@ class PauseDetector {
   constructor(config?: Partial<PauseDetector['config']>) {
     // Default configuration - adjusted for MediaPipe's 0-1 coordinate scale
     this.config = {
-      minPauseDurationMs: 150,       // Minimum time to confirm a pause
-      velocityThreshold: 0.01,       // Maximum velocity considered "paused"
-      positionVarianceThreshold: 0.0005, // Max position variance for stable pause
+      bufferSize: 10,
+      minPauseDurationMicros: 120000, // This is 120 milliseconds
+      velocityThreshold: 0.15,
+      positionVarianceThreshold: 0.015,
       minPointsForVariance: 5,      // Minimum points needed to calculate variance
       varianceWindowSize: 5,        // Window size for variance calculation
       ...config
@@ -685,32 +687,14 @@ class PauseDetector {
     this.velocities.push({ t: point.t, v: velocity });
     
     // Limit history size
-    if (this.points.length > 30) {
+    if (this.points.length > this.config.bufferSize) {
       this.points.shift();
       this.velocities.shift();
     }
     
-    // Check if velocity is below threshold (potential pause)
-    if (velocity <= this.config.velocityThreshold) {
-      if (this.pauseStartTime === null) {
-        // Start tracking potential pause
-        this.pauseStartTime = point.t;
-      } else {
-        // Check if pause has lasted long enough to be confirmed
-        const pauseDuration = point.t - this.pauseStartTime;
-        
-        if (pauseDuration >= this.config.minPauseDurationMs) {
-          // Check position stability for actual pause (vs. slow movement)
-          if (this.isPositionStable()) {
-            this.pauseConfirmed = true;
-          }
-        }
-      }
-    } else {
-      // Reset pause detection if velocity goes above threshold
-      this.pauseStartTime = null;
-      this.pauseConfirmed = false;
-    }
+    // Check for pause using microsecond timestamp
+    const currentTimeMicros = point.t * 1000; // Convert ms to microseconds
+    this.isPaused(currentTimeMicros);
   }
 
   /**
@@ -757,10 +741,73 @@ class PauseDetector {
 
   /**
    * Check if a pause is currently detected
+   * @param currentTimeMicros Current time in microseconds
    * @returns true if pause is confirmed
    */
-  isPaused(): boolean {
-    return this.pauseConfirmed;
+  isPaused(currentTimeMicros: number = Date.now() * 1000): boolean {
+    // If we have no points or insufficient data, return current state
+    if (this.points.length < this.config.minPointsForVariance) {
+      return this.pauseConfirmed;
+    }
+    
+    // Check velocity stability over recent points
+    const recentVelocities = this.velocities.slice(-this.config.varianceWindowSize);
+    const avgVelocity = recentVelocities.reduce((sum, v) => sum + v.v, 0) / recentVelocities.length;
+    const isVelocityLow = avgVelocity < this.config.velocityThreshold;
+    
+    // Check position stability
+    const recentPoints = this.points.slice(-this.config.varianceWindowSize);
+    
+    // Find min/max for each dimension to check range
+    const xValues = recentPoints.map(p => p.x);
+    const yValues = recentPoints.map(p => p.y);
+    const zValues = recentPoints.filter(p => p.z !== undefined).map(p => p.z!);
+    
+    const xRange = Math.max(...xValues) - Math.min(...xValues);
+    const yRange = Math.max(...yValues) - Math.min(...yValues);
+    const zRange = zValues.length > 0 ? Math.max(...zValues) - Math.min(...zValues) : 0;
+    
+    const maxRange = Math.max(xRange, yRange, zRange);
+    const isPositionStable = maxRange < this.config.positionVarianceThreshold;
+    
+    // Log current values for debugging
+    console.log(
+      `PauseDetector Check: AvgVel=${avgVelocity.toFixed(4)}, ` +
+      `VelThr=${this.config.velocityThreshold.toFixed(4)}, IsLowVel=${isVelocityLow} | ` +
+      `PosRange=${maxRange.toFixed(4)}, PosThr=${this.config.positionVarianceThreshold.toFixed(4)}, ` +
+      `IsStablePos=${isPositionStable}`
+    );
+    
+    // Check if conditions for pause are met
+    if (isVelocityLow && isPositionStable) {
+      // Initialize pause start time if this is the first frame of a potential pause
+      if (this.pauseStartTime === null) {
+        this.pauseStartTime = currentTimeMicros / 1000; // Convert to milliseconds for internal storage
+        console.log("Pause start timer set:", this.pauseStartTime);
+      }
+      
+      // Calculate duration since pause started (in microseconds)
+      if (this.pauseStartTime !== null) {
+        const elapsedMicros = currentTimeMicros - (this.pauseStartTime * 1000); // Convert stored time back to microseconds
+        console.log(`Duration Check: Elapsed=${elapsedMicros}µs, Required=${this.config.minPauseDurationMicros}µs`);
+        
+        // Check if we've paused long enough to confirm
+        const hasPausedLongEnough = elapsedMicros >= this.config.minPauseDurationMicros;
+        
+        // Update pause confirmed state
+        this.pauseConfirmed = hasPausedLongEnough;
+        
+        return hasPausedLongEnough;
+      } else {
+        // Defensive coding - shouldn't happen with above logic
+        return false;
+      }
+    } else {
+      // Conditions not met, reset pause timer
+      this.pauseStartTime = null;
+      this.pauseConfirmed = false;
+      return false;
+    }
   }
 
   /**
@@ -820,9 +867,10 @@ const HandTracker: React.FC = () => {
   const velocityFilterRef = useRef(new ExponentialSmoothingFilter(0.3));
   const velocityHistoryRef = useRef(new VelocityHistoryBuffer(500, 0.05)); // 500ms window, adjusted default threshold
   const pauseDetectorRef = useRef(new PauseDetector({
-    minPauseDurationMs: 150,
-    velocityThreshold: 0.01,
-    positionVarianceThreshold: 0.0005
+    bufferSize: 10,
+    minPauseDurationMicros: 120000, // This is 120 milliseconds
+    velocityThreshold: 0.15,
+    positionVarianceThreshold: 0.015
   }));
   const currentStrokeRef = useRef<Array<{ x: number; y: number; z?: number; t: number }>>([]);
   const lastPauseTimeRef = useRef<number>(0);
