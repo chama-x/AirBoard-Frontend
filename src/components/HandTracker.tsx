@@ -1580,17 +1580,18 @@ const HandTracker: React.FC = () => {
               if (isSessionActive) {
                 const RESTART_COOLDOWN_MICROS = 150000; // 150ms cooldown after pause
                 
-                // Get pause status
-                const isPaused = pauseDetectorRef.current.isPaused();
+                // Get pause status with current time in microseconds
+                const currentTimeMicros = filteredPoint.t * 1000; // Convert ms to microseconds
+                const isPaused = pauseDetectorRef.current.isPaused(currentTimeMicros);
                 
                 // Log current state for debugging (commented out to reduce noise)
-                // console.log(`Phase: ${drawingPhase}, Speed: ${finalVelocity.toFixed(4)}, LowT: ${velocityLowThreshold.toFixed(4)}, HighT: ${velocityHighThreshold.toFixed(4)}, isPaused: ${isPaused}`);
+                // console.log(`Phase: ${drawingPhase}, Speed: ${finalVelocity.toFixed(4)}, HighT: ${velocityHighThreshold.toFixed(4)}, isPaused: ${isPaused}`);
                 
                 switch (drawingPhase) {
                   case 'IDLE':
                     const timeSinceLastPause = filteredPoint.t - lastPauseTimeRef.current;
                     // Check for start condition: Speed > High Threshold AND Cooldown Met
-                    if (finalVelocity > velocityHighThreshold && timeSinceLastPause > RESTART_COOLDOWN_MICROS) {
+                    if (finalVelocity > velocityHighThreshold && timeSinceLastPause > RESTART_COOLDOWN_MICROS / 1000) { // Convert microseconds to milliseconds
                       console.log(`State Change: IDLE -> DRAWING (V=${finalVelocity.toFixed(4)} > HT=${velocityHighThreshold.toFixed(4)}, Cooldown OK)`);
                       setDrawingPhase('DRAWING');
                       currentStrokeRef.current = [filteredPoint]; // Start new stroke buffer
