@@ -782,28 +782,25 @@ class PauseDetector {
     if (isVelocityLow && isPositionStable) {
       // Initialize pause start time if this is the first frame of a potential pause
       if (this.pauseStartTime === null) {
-        this.pauseStartTime = currentTimeMicros / 1000; // Convert to milliseconds for internal storage
+        this.pauseStartTime = currentTimeMicros / 1000; // We store in ms for compatibility with other code
         console.log("Pause start timer set:", this.pauseStartTime);
+        return false; // Not paused long enough on the very first frame
       }
       
       // Calculate duration since pause started (in microseconds)
-      if (this.pauseStartTime !== null) {
-        const elapsedMicros = currentTimeMicros - (this.pauseStartTime * 1000); // Convert stored time back to microseconds
-        console.log(`Duration Check: Elapsed=${elapsedMicros}µs, Required=${this.config.minPauseDurationMicros}µs`);
-        
-        // Check if we've paused long enough to confirm
-        const hasPausedLongEnough = elapsedMicros >= this.config.minPauseDurationMicros;
-        
-        // Update pause confirmed state
-        this.pauseConfirmed = hasPausedLongEnough;
-        
-        return hasPausedLongEnough;
-      } else {
-        // Defensive coding - shouldn't happen with above logic
-        return false;
-      }
+      const elapsedMicros = currentTimeMicros - (this.pauseStartTime * 1000); // Convert stored ms to microseconds
+      console.log(`Duration Check: Elapsed=${elapsedMicros}µs, Required=${this.config.minPauseDurationMicros}µs`);
+      
+      // Check if we've paused long enough to confirm
+      const hasPausedLongEnough = elapsedMicros >= this.config.minPauseDurationMicros;
+      
+      // Update pause confirmed state based on duration
+      this.pauseConfirmed = hasPausedLongEnough;
+      
+      // Return true ONLY if duration is met
+      return hasPausedLongEnough;
     } else {
-      // Conditions not met, reset pause timer
+      // Conditions not met, reset pause timer and confirmation
       this.pauseStartTime = null;
       this.pauseConfirmed = false;
       return false;
