@@ -1,6 +1,34 @@
-import React, { useEffect, useRef, useState, useCallback } from 'react';
+import React, { useEffect, useRef, useState, useCallback, useMemo } from 'react';
 import { HandLandmarker, FilesetResolver, HandLandmarkerResult, NormalizedLandmark } from '@mediapipe/tasks-vision';
 import { PlayIcon, StopIcon, ArrowPathIcon, VideoCameraIcon, VideoCameraSlashIcon } from '@heroicons/react/24/solid';
+import { Line } from 'react-chartjs-2';
+import {
+    Chart as ChartJS,
+    CategoryScale,
+    LinearScale,
+    PointElement,
+    LineElement,
+    Title,
+    Tooltip,
+    Legend,
+    TimeScale, // Import TimeScale for time-based x-axis
+    ChartOptions
+} from 'chart.js';
+import 'chartjs-adapter-date-fns'; // Import adapter for time scale
+import { batmanTheme } from '../config/theme';
+
+// Register necessary Chart.js components
+ChartJS.register(
+    CategoryScale,
+    LinearScale,
+    PointElement,
+    LineElement,
+    TimeScale, // Register TimeScale
+    Title,
+    Tooltip,
+    Legend
+);
+
 // Assuming you might have drawing_utils from MediaPipe or a custom one
 // If using MediaPipe's utils directly, you might need to install @mediapipe/drawing_utils
 // For now, let's use the basic drawing function defined inside.
@@ -13,9 +41,17 @@ const PROCESS_NOISE_Q = 0.01; // Process noise - how much we expect the motion m
 const MEASUREMENT_NOISE_R = 0.2; // Measurement noise - how much we expect the measurements to be noisy (higher = trust measurements less)
 const INITIAL_COVARIANCE_P = 1.0; // Initial state covariance - higher means less trust in initial state
 const DT = 1/30; // Time delta between frames in seconds - 30 FPS assumption
-const VELOCITY_STOP_THRESHOLD = 0.08; // Velocity threshold for auto-stopping recording (needs tuning)
-const STOP_DURATION_MS = 500; // ms - Time speed must be below threshold to stop (needs tuning)
-const MIN_PATH_LENGTH_FOR_AUTOSTOP = 10; // Minimum number of points needed before auto-stop can activate
+
+// Chart update throttling
+const CHART_UPDATE_THROTTLE_MS = 200; // Increased for smoother performance
+
+// --- Segmentation Parameters (Tunable) ---
+const MIN_PAUSE_DURATION_MS = 300; // Increased to require longer pause
+const ACCEL_THRESHOLD_PAUSE = 15.0; // Decreased for stricter stability check (NEEDS EMPIRICAL TUNING!)
+// const JERK_THRESHOLD_PAUSE = 0.0001; // Optional: Max jerk magnitude for stability (disabled for simplification)
+const ADAPTIVE_VEL_THRESHOLD_RATIO = 0.25; // Increased sensitivity for low velocity detection
+const ADAPTIVE_VEL_WINDOW_MS = 500; // Time window (ms) to calculate peak velocity over
+const MIN_SEGMENT_LENGTH = 10; // Minimum number of points for a segment to be processed
 
 // Path trimming constants
 const TRIM_MIN_PATH_LENGTH = 5; // Min points needed to attempt trimming
@@ -26,6 +62,9 @@ const TRIM_VARIANCE_THRESHOLD = 0.00001; // Threshold for variance detection (ne
 const LOCAL_STORAGE_KEY = 'airboard_collected_data';
 const TARGET_SAMPLES_PER_DIGIT = 50;
 const NUM_CLASSES = 10;
+
+// Kinematic data buffer constants
+const MAX_KINEMATIC_HISTORY = 100; // Maximum number of points to keep in kinematic history
 
 /**
  * 2D Kalman Filter for smoothing finger tip trajectories
@@ -445,12 +484,31 @@ const HandTracker: React.FC = () => {
   const [wsStatus, setWsStatus] = useState<WsStatus>('disconnected');
   const [predictedDigit, setPredictedDigit] = useState<number | string | null>(null);
   const [predictionConfidence, setPredictionConfidence] = useState<number | null>(null);
+  const [isTrainingMode, setIsTrainingMode] = useState<boolean>(true);
+  const [prediction, setPrediction] = useState<number | null>(null);
+  const [showCharts, setShowCharts] = useState<boolean>(false); // Start with charts hidden
+  
+  // Kinematic data state
+  const [velocityHistory, setVelocityHistory] = useState<Array<{t: number; vx: number; vy: number; v: number}>>([]);
+  const [accelerationHistory, setAccelerationHistory] = useState<Array<{t: number; ax: number; ay: number; a: number}>>([]);
+  const [currentSpeed, setCurrentSpeed] = useState<number>(0);
+  const [currentAcceleration, setCurrentAcceleration] = useState<number>(0);
+  
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const requestRef = useRef<number | null>(null); // For requestAnimationFrame handle
   const kalmanFilterRef = useRef<KalmanFilter2D | null>(null); // Kalman filter instance
   const lastFrameTimeRef = useRef<number>(0); // Track last frame time for dt calculation
   const timeBelowThresholdStartRef = useRef<number | null>(null); // Track when speed drops below threshold
+  const lastChartUpdateTimeRef = useRef<number>(0); // For throttling chart updates
+  
+  // Refs for advanced path segmentation
+  const isPausedRef = useRef<boolean>(false);
+  const pauseStartTimeRef = useRef<number | null>(null);
+  const velocityHistoryRef = useRef<Array<{ t: number; v: number }>>([]); // For adaptive threshold
+  const currentSegmentRef = useRef<Array<{ x: number; y: number; z?: number; t: number }>>([]); // Holds points for the current character/segment
+  const prevVelocityRef = useRef<{ vx: number; vy: number; t: number } | null>(null); // For acceleration calculation
+  const prevAccelRef = useRef<{ ax: number; ay: number; t: number } | null>(null); // For jerk calculation (optional)
 
   // --- Basic Drawing Utility ---
   const drawLandmarks = (ctx: CanvasRenderingContext2D, landmarks: NormalizedLandmark[]) => {
@@ -537,6 +595,54 @@ const HandTracker: React.FC = () => {
     return chosenDigit;
   };
   
+  // Function to finalize and process a completed segment
+  const finalizeAndProcessSegment = (segmentPoints: Array<{ x: number; y: number; z?: number; t: number }>) => {
+    // Check if segment has enough points
+    if (segmentPoints.length < MIN_SEGMENT_LENGTH) {
+      console.log(`Segment too short (${segmentPoints.length} points), ignoring.`);
+      return;
+    }
+
+    console.log(`Processing segment with ${segmentPoints.length} points.`);
+
+    // Normalize the segment (translate so first point is at origin)
+    const firstPoint = segmentPoints[0];
+    const normalizedPoints: Point[] = segmentPoints.map(p => ({
+      x: p.x - firstPoint.x,
+      y: p.y - firstPoint.y,
+      z: p.z !== undefined ? p.z - (firstPoint.z ?? 0) : undefined
+    }));
+
+    // Optional: Apply additional processing like trimming or resampling
+    // (similar to the existing trimNoisyTail function but applied to the segment)
+    
+    // Format the processed segment for prediction or saving
+    if (isTrainingMode) {
+      // In training mode, save the segment with the current digit label
+      if (digitToDraw !== null) {
+        submitDrawing(normalizedPoints);
+      }
+    } else {
+      // In prediction mode, send to backend for prediction
+      setPrediction(null); // Clear previous prediction while waiting
+      
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        try {
+          const dataToSend = JSON.stringify({ path: normalizedPoints });
+          ws.send(dataToSend);
+          console.log("Sent segment for prediction:", normalizedPoints.length, "points");
+        } catch (error) {
+          console.error("Error sending segment for prediction:", error);
+        }
+      } else {
+        console.warn("WebSocket not open, cannot get prediction");
+      }
+    }
+    
+    // Clear current path for visualization
+    setCurrentPath([]);
+  };
+  
   // Define a function to fetch the next digit
   const fetchNextDigit = useCallback(() => {
     console.log("Determining next digit locally...");
@@ -556,35 +662,57 @@ const HandTracker: React.FC = () => {
       console.log('WebSocket connection established.');
       setWsStatus('connected');
       setWs(socket);
-      // Instead of fetchNextDigitPrompt, use local determination
-      const initialDigit = determineNextDigit();
-      setDigitToDraw(initialDigit);
+      // Only initialize digit in training mode
+      if (isTrainingMode) {
+        const initialDigit = determineNextDigit();
+        setDigitToDraw(initialDigit);
+      }
     };
 
     socket.onmessage = (event) => {
       console.log('WebSocket message received:', event.data);
       try {
-        const result = JSON.parse(event.data);
-        if (result && result.prediction !== undefined) {
-           // Successfully received prediction
-           setPredictedDigit(result.prediction);
-           setPredictionConfidence(result.confidence !== undefined ? result.confidence : null);
-        } else if (result && result.error) {
-           // Handle potential errors sent from backend
-           console.error("Backend error received:", result.error);
-           setPredictedDigit(`Error: ${result.error}`);
-           setPredictionConfidence(null);
+        const message = JSON.parse(event.data);
+        console.log('Parsed WebSocket message:', message);
+        
+        // Check if it's a prediction result (and not in training mode)
+        if (!isTrainingMode && message.prediction !== undefined) {
+          // Update prediction state with the prediction value
+          setPrediction(message.prediction);
+          
+          // Log prediction and confidence
+          console.log(`Received prediction: ${message.prediction} (Confidence: ${
+            message.confidence !== undefined ? message.confidence : 'unknown'
+          })`);
+          
+          // Also set these for compatibility with existing UI
+          setPredictedDigit(message.prediction);
+          setPredictionConfidence(message.confidence !== undefined ? message.confidence : null);
+        } 
+        // For training mode (keeping existing logic)
+        else if (isTrainingMode && message.prediction !== undefined) {
+          // Successfully received prediction for training mode
+          setPredictedDigit(message.prediction);
+          setPredictionConfidence(message.confidence !== undefined ? message.confidence : null);
+        } else if (message.error) {
+          // Handle potential errors sent from backend
+          console.error("Backend error received:", message.error);
+          setPredictedDigit(`Error: ${message.error}`);
+          setPredictionConfidence(null);
+          setPrediction(null);
         } else {
-           // Unexpected message format
-           console.warn("Received unexpected message format:", result);
-           setPredictedDigit("?");
-           setPredictionConfidence(null);
+          // Unexpected message format
+          console.warn("Received unexpected message format:", message);
+          setPredictedDigit("?");
+          setPredictionConfidence(null);
+          setPrediction(null);
         }
       } catch (error) {
-         console.error('Error parsing WebSocket message or invalid format:', error);
-         // Display raw data if parsing fails but data exists
-         setPredictedDigit(event.data ? `Data: ${event.data.substring(0, 30)}...` : "?");
-         setPredictionConfidence(null);
+        console.error('Failed to parse WebSocket message or process it:', error);
+        // Display raw data if parsing fails but data exists
+        setPredictedDigit(event.data ? `Data: ${event.data.substring(0, 30)}...` : "?");
+        setPredictionConfidence(null);
+        setPrediction(null);
       }
     };
 
@@ -609,7 +737,7 @@ const HandTracker: React.FC = () => {
       setWs(null);
       setWsStatus('disconnected');
     };
-  }, []); // Empty dependency array ensures this runs only once on mount/unmount
+  }, [isTrainingMode]); // Keep this as empty array to avoid reconnections when mode changes
 
   // --- Initialize HandLandmarker ---
   useEffect(() => {
@@ -646,7 +774,7 @@ const HandTracker: React.FC = () => {
 
   // --- Drawing Controls ---
   const submitDrawing = useCallback((pathToSend: Point[]) => { // Takes path as argument
-    if (digitToDraw === null || !pathToSend || pathToSend.length < 2) {
+    if (isTrainingMode && (digitToDraw === null || !pathToSend || pathToSend.length < 2)) {
          console.warn("Cannot submit drawing - no prompted digit or invalid path.");
          // Reset state partially?
          setCurrentPath([]);
@@ -654,79 +782,94 @@ const HandTracker: React.FC = () => {
          return;
     }
     
-    console.log(`Submitting path for prompted digit: ${digitToDraw}`);
-    
-    // --- Start of Local Storage Logic ---
-    try {
-        // 1. Get existing data string from localStorage
-        const existingDataString = localStorage.getItem(LOCAL_STORAGE_KEY);
-
-        // 2. Parse existing data (or initialize if none)
-        let dataArray: { label: number, path: Point[] }[] = [];
-        if (existingDataString) {
-            try {
-                dataArray = JSON.parse(existingDataString);
-                if (!Array.isArray(dataArray)) { // Basic validation
-                   console.warn("Invalid data found in localStorage, resetting.");
-                   dataArray = [];
-                }
-            } catch (parseError) {
-                console.error("Error parsing data from localStorage:", parseError);
-                // Optionally reset if parsing fails
-                dataArray = []; 
-            }
-        }
-
-        // 3. Create new entry
-        const newEntry = { label: digitToDraw, path: pathToSend };
-
-        // 4. Append new entry
-        dataArray.push(newEntry);
-
-        // 5. Stringify updated array
-        const updatedDataString = JSON.stringify(dataArray);
-
-        // 6. Save back to localStorage
-        localStorage.setItem(LOCAL_STORAGE_KEY, updatedDataString);
-        console.log(`Drawing for digit ${digitToDraw} saved locally. Total samples: ${dataArray.length}`);
-
-        // 7. Automatically determine the next digit after successful save
-        setTimeout(() => {
-          fetchNextDigit();
-        }, 1000); // Small delay for better UX
-
-    } catch (error) {
-        console.error("Error saving data to localStorage:", error);
-        // Handle error, still try to fetch next digit
-        setTimeout(() => {
-          fetchNextDigit();
-        }, 1000);
-    }
-    
-    // Try to send via WebSocket if available (can be disabled if not needed)
-    if (ws && ws.readyState === WebSocket.OPEN) {
+    // In training mode, save the data to localStorage
+    if (isTrainingMode) {
+      console.log(`Submitting path for prompted digit: ${digitToDraw}`);
+      
+      // --- Start of Local Storage Logic ---
       try {
-          const dataToSend = JSON.stringify({ path: pathToSend, label: digitToDraw });
-          ws.send(dataToSend);
-          console.log("Drawing path also sent via WebSocket.");
+          // 1. Get existing data string from localStorage
+          const existingDataString = localStorage.getItem(LOCAL_STORAGE_KEY);
+
+          // 2. Parse existing data (or initialize if none)
+          let dataArray: { label: number, path: Point[] }[] = [];
+          if (existingDataString) {
+              try {
+                  dataArray = JSON.parse(existingDataString);
+                  if (!Array.isArray(dataArray)) { // Basic validation
+                    console.warn("Invalid data found in localStorage, resetting.");
+                    dataArray = [];
+                  }
+              } catch (parseError) {
+                  console.error("Error parsing data from localStorage:", parseError);
+                  // Optionally reset if parsing fails
+                  dataArray = []; 
+              }
+          }
+
+          // 3. Create new entry
+          if (digitToDraw !== null) {
+            const newEntry = { label: digitToDraw, path: pathToSend };
+
+            // 4. Append new entry
+            dataArray.push(newEntry);
+
+            // 5. Stringify updated array
+            const updatedDataString = JSON.stringify(dataArray);
+
+            // 6. Save back to localStorage
+            localStorage.setItem(LOCAL_STORAGE_KEY, updatedDataString);
+            console.log(`Drawing for digit ${digitToDraw} saved locally. Total samples: ${dataArray.length}`);
+
+            // 7. Automatically determine the next digit after successful save
+            setTimeout(() => {
+              fetchNextDigit();
+            }, 1000); // Small delay for better UX
+          }
       } catch (error) {
-          console.error("Error sending drawing path via WebSocket:", error);
+          console.error("Error saving data to localStorage:", error);
+          // Handle error, still try to fetch next digit
+          setTimeout(() => {
+            fetchNextDigit();
+          }, 1000);
+      }
+      
+      // Try to send to WebSocket if available (for training data collection)
+      if (ws && ws.readyState === WebSocket.OPEN && digitToDraw !== null) {
+        try {
+            const dataToSend = JSON.stringify({ path: pathToSend, label: digitToDraw });
+            ws.send(dataToSend);
+            console.log("Drawing path also sent via WebSocket for training.");
+        } catch (error) {
+            console.error("Error sending drawing path via WebSocket:", error);
+        }
+      } else {
+          console.warn("WebSocket not open, skipping send but data was saved locally.");
       }
     } else {
-        console.warn("WebSocket not open, skipping send but data was saved locally.");
+      // In prediction mode, just send the drawing for prediction via WebSocket
+      // (this code is handling the case where submitDrawing is called directly in prediction mode)
+      if (ws && ws.readyState === WebSocket.OPEN && pathToSend.length > 1) {
+        try {
+          const dataToSend = JSON.stringify({ path: pathToSend });
+          ws.send(dataToSend);
+          console.log("Sent path data for prediction:", pathToSend.length, "points");
+        } catch (error) {
+          console.error("Error sending drawing path for prediction:", error);
+        }
+      }
     }
     
-    // Reset current path and prediction, but not digitToDraw yet
-    // (that will happen after fetching the next digit)
+    // Reset current path and prediction for both modes
     setCurrentPath([]);
     setPredictedDigit(null);
     setPredictionConfidence(null);
     
-  }, [digitToDraw, setCurrentPath, setDigitToDraw, fetchNextDigit]);
+  }, [digitToDraw, setCurrentPath, setDigitToDraw, fetchNextDigit, ws, isTrainingMode]);
 
   const handleStopDrawing = useCallback(() => {
-    if (!isRecording || digitToDraw === null) return; // Check digitToDraw too
-    console.log(`Stopping path recording for digit: ${digitToDraw}...`);
+    if (!isRecording) return; 
+    console.log(`Stopping path recording...`);
     setIsRecording(false);
     // Reset threshold timer
     timeBelowThresholdStartRef.current = null;
@@ -737,54 +880,111 @@ const HandTracker: React.FC = () => {
     const trimmedPath = trimNoisyTail(rawPath);
     console.log(`Path trimming: Original=${rawPath.length}, Trimmed=${trimmedPath.length}`);
     
-    // We're now using Kalman filter for real-time smoothing, so we don't need the
-    // post-processing moving average filter anymore. The path is already filtered.
-    // const smoothingWindowSize = 3;
-    // const smoothedPath = smoothPath(rawPath, smoothingWindowSize);
-    
     // Use the Kalman-filtered and trimmed path
     const filteredPath = trimmedPath;
 
-    console.log("Path Recorded (Points):", rawPath.length, rawPath);
-    // console.log(`Smoothed Path (Window ${smoothingWindowSize}, Points):`, smoothedPath.length, smoothedPath);
+    console.log("Path Recorded (Points):", rawPath.length);
     console.log("Kalman Filtered & Trimmed Path (Points):", filteredPath.length);
 
     if (filteredPath.length > 1) {
-        // Immediately submit the path with the prompted label
-        submitDrawing(filteredPath); // Call submit function with Kalman-filtered path
+      if (isTrainingMode) {
+        // Training mode - save data with label
+        if (digitToDraw !== null) {
+          submitDrawing(filteredPath); // Call submit function with Kalman-filtered path
+        } else {
+          console.warn("Cannot submit drawing - no prompted digit.");
+          setCurrentPath([]); // Clear visual path
+        }
+      } else {
+        // Prediction mode - send to backend for prediction
+        setPrediction(null); // Clear previous prediction while waiting
+        
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          try {
+            const dataToSend = JSON.stringify({ path: filteredPath });
+            ws.send(dataToSend);
+            console.log("Sent path data for prediction:", filteredPath.length, "points");
+          } catch (error) {
+            console.error("Error sending drawing path for prediction:", error);
+          }
+        } else {
+          console.warn("WebSocket not open, cannot get prediction");
+        }
+        
+        // Just clear the path in prediction mode, no need to save
+        setCurrentPath([]);
+      }
     } else {
-        console.log("Path too short, skipping submission.");
-        setCurrentPath([]); // Clear visual path if too short
-        fetchNextDigit(); // Still fetch next digit
+      console.log("Path too short, skipping submission.");
+      setCurrentPath([]); // Clear visual path if too short
+      if (isTrainingMode && digitToDraw === null) {
+        fetchNextDigit(); // Still fetch next digit in training mode
+      }
     }
     
     // Reset Kalman filter after submission
     kalmanFilterRef.current = null;
-  }, [isRecording, digitToDraw, currentPath, submitDrawing, fetchNextDigit]);
+  }, [isRecording, digitToDraw, currentPath, submitDrawing, fetchNextDigit, ws, isTrainingMode]);
 
   const handleStartDrawing = useCallback(() => {
-    if (!webcamRunning || digitToDraw === null) return; // Don't start if no prompt
-    console.log(`Starting path recording for digit: ${digitToDraw}...`);
+    if (!webcamRunning) return; // Don't start if webcam not running
+    
+    // In training mode, we need a digit prompt
+    if (isTrainingMode && digitToDraw === null) {
+      console.warn("Cannot start recording in training mode without a digit prompt");
+      return;
+    }
+    
+    console.log(`Starting path recording${isTrainingMode ? ` for digit: ${digitToDraw}` : ''}`);
     setCurrentPath([]); // Clear previous visual path
     setPredictedDigit(null);
     setPredictionConfidence(null);
+    setPrediction(null); // Clear any previous prediction
     setIsRecording(true);
     
     // Reset Kalman filter for new drawing
     kalmanFilterRef.current = null;
-    // Reset threshold timer
+    
+    // Reset segmentation refs
+    isPausedRef.current = false;
+    pauseStartTimeRef.current = null;
+    velocityHistoryRef.current = [];
+    currentSegmentRef.current = [];
+    prevVelocityRef.current = null;
+    prevAccelRef.current = null;
+    
+    // Reset threshold timer (old logic, can be removed if not used elsewhere)
     timeBelowThresholdStartRef.current = null;
-  }, [webcamRunning, digitToDraw, setCurrentPath, setPredictedDigit, setPredictionConfidence, setIsRecording]);
+  }, [webcamRunning, digitToDraw, isTrainingMode]);
 
-  // Add Reset Drawing functionality
+  // Reset Drawing functionality
   const handleResetDrawing = useCallback(() => {
     console.log("Drawing reset.");
     setCurrentPath([]);
-    // Reset Kalman filter as done in handleStartDrawing
+    setPrediction(null); // Clear prediction display
+    setPredictedDigit(null);
+    setPredictionConfidence(null);
+    
+    // Reset kinematic data
+    setVelocityHistory([]);
+    setAccelerationHistory([]);
+    setCurrentSpeed(0);
+    setCurrentAcceleration(0);
+    
+    // Reset Kalman filter
     kalmanFilterRef.current = null;
-    // Reset threshold timer
+    
+    // Reset segmentation refs
+    isPausedRef.current = false;
+    pauseStartTimeRef.current = null;
+    velocityHistoryRef.current = [];
+    currentSegmentRef.current = [];
+    prevVelocityRef.current = null;
+    prevAccelRef.current = null;
+    
+    // Reset threshold timer (old logic, can be removed if not used elsewhere)
     timeBelowThresholdStartRef.current = null;
-  }, [setCurrentPath]);
+  }, []);
 
   // --- Effect for MediaPipe Hand Detection and Drawing ---
   useEffect(() => {
@@ -829,6 +1029,8 @@ const HandTracker: React.FC = () => {
             const normalizedPos = {
               x: indexTip.x,
               y: indexTip.y,
+              z: indexTip.z,
+              t: time, // Add timestamp for kinematic calculations
             };
 
             // Initialize Kalman filter if needed
@@ -837,45 +1039,165 @@ const HandTracker: React.FC = () => {
             }
 
             // Update Kalman filter with new measurement and get filtered position
-            // Pass time for timestamp-based filtering (uses timeElapsedMs indirectly)
             const [filteredX, filteredY] = kalmanFilterRef.current.process(normalizedPos.x, normalizedPos.y, time);
             
-            // Store the filtered position for use in path recording
-            const filteredFingerTip = {
+            // Create the filtered point with timestamp
+            const filteredPoint = {
               x: filteredX,
               y: filteredY,
-              z: indexTip.z // Preserve the original z coordinate if needed
+              z: indexTip.z, // Preserve the original z coordinate
+              t: time,       // Store current time
             };
             
-            // Get velocity magnitude directly from the Kalman filter
-            const velocityMagnitude = kalmanFilterRef.current.getSpeed();
-
-            // Auto-stop drawing when velocity becomes very low
+            // If we're in recording mode, process the point for path segmentation
             if (isRecording) {
-              // Add the filtered finger tip to the path FIRST
-              setCurrentPath(prevPath => [...prevPath, filteredFingerTip]);
+              // Add the filtered point to the visual path for display
+              setCurrentPath(prevPath => [...prevPath, { x: filteredX, y: filteredY, z: indexTip.z }]);
               
-              // NOW, check for auto-stop ONLY if path is long enough
-              if (currentPath.length > MIN_PATH_LENGTH_FOR_AUTOSTOP && kalmanFilterRef.current) {
-                if (velocityMagnitude < VELOCITY_STOP_THRESHOLD) {
-                  // If we haven't started timing yet, record the start time
-                  if (timeBelowThresholdStartRef.current === null) {
-                    timeBelowThresholdStartRef.current = time;
-                  } 
-                  // Check if we've been below threshold for long enough to stop
-                  else if ((time - timeBelowThresholdStartRef.current) >= STOP_DURATION_MS) {
-                    console.log(`Auto-stopping after ${STOP_DURATION_MS}ms below velocity threshold. Path length: ${currentPath.length}`);
-                    handleStopDrawing();
+              // Add the filtered point to the current segment (with timestamp)
+              currentSegmentRef.current.push(filteredPoint);
+              
+              // Calculate velocity if we have at least two points
+              if (currentSegmentRef.current.length >= 2) {
+                const currentPoint = filteredPoint;
+                const prevPoint = currentSegmentRef.current[currentSegmentRef.current.length - 2];
+                const dt = (currentPoint.t - prevPoint.t) / 1000; // Convert to seconds
+                
+                if (dt > 0) { // Avoid division by zero
+                  // Calculate velocity components
+                  const vx = (currentPoint.x - prevPoint.x) / dt;
+                  const vy = (currentPoint.y - prevPoint.y) / dt;
+                  const currentSpeed = Math.sqrt(vx * vx + vy * vy);
+                  
+                  // Update current speed state
+                  setCurrentSpeed(currentSpeed);
+                  
+                  // Add to velocity history with throttling
+                  const now = time;
+                  if (now - lastChartUpdateTimeRef.current > CHART_UPDATE_THROTTLE_MS) {
+                    // Add to velocity history
+                    setVelocityHistory(prev => {
+                      const newHistory = [...prev, { t: time, vx, vy, v: currentSpeed }];
+                      // Trim history if it exceeds max length
+                      return newHistory.length > MAX_KINEMATIC_HISTORY 
+                        ? newHistory.slice(-MAX_KINEMATIC_HISTORY) 
+                        : newHistory;
+                    });
+                    
+                    // Calculate acceleration if we have previous velocity
+                    if (prevVelocityRef.current && dt > 0) {
+                      const ax = (vx - prevVelocityRef.current.vx) / dt;
+                      const ay = (vy - prevVelocityRef.current.vy) / dt;
+                      const currentAccelMag = Math.sqrt(ax * ax + ay * ay);
+                      
+                      // Update current acceleration state
+                      setCurrentAcceleration(currentAccelMag);
+                      
+                      // Add to acceleration history
+                      setAccelerationHistory(prev => {
+                        const newHistory = [...prev, { t: time, ax, ay, a: currentAccelMag }];
+                        // Trim history if it exceeds max length
+                        return newHistory.length > MAX_KINEMATIC_HISTORY 
+                          ? newHistory.slice(-MAX_KINEMATIC_HISTORY) 
+                          : newHistory;
+                      });
+                      
+                      // Update the last chart update time
+                      lastChartUpdateTimeRef.current = now;
+                    }
                   }
-                } else {
-                  // Reset the timer if velocity goes above threshold
-                  timeBelowThresholdStartRef.current = null;
+                  
+                  // Store in velocity history for adaptive thresholding - always do this regardless of throttling
+                  velocityHistoryRef.current.push({ t: time, v: currentSpeed });
+                  
+                  // Trim velocity history to only include recent points
+                  const cutoffTime = time - ADAPTIVE_VEL_WINDOW_MS;
+                  velocityHistoryRef.current = velocityHistoryRef.current.filter(item => item.t >= cutoffTime);
+                  
+                  // Calculate adaptive velocity threshold based on peak speed
+                  const peakSpeed = Math.max(...velocityHistoryRef.current.map(item => item.v), 0.001); // Avoid zero
+                  const adaptiveVelocityThreshold = peakSpeed * ADAPTIVE_VEL_THRESHOLD_RATIO;
+                  
+                  // Calculate acceleration if we have previous velocity - move this outside throttling
+                  let currentAccelMag = 0;
+                  // let currentJerkMag = 0; // Disabled jerk calculation for simplification
+                  
+                  if (prevVelocityRef.current && dt > 0) {
+                    const ax = (vx - prevVelocityRef.current.vx) / dt;
+                    const ay = (vy - prevVelocityRef.current.vy) / dt;
+                    currentAccelMag = Math.sqrt(ax * ax + ay * ay);
+                    
+                    // Update current acceleration state - do this even when throttling chart updates
+                    setCurrentAcceleration(currentAccelMag);
+                    
+                    // Calculate jerk if needed and we have previous acceleration
+                    if (prevAccelRef.current && dt > 0) {
+                      // Jerk calculation disabled for simplification
+                      // const jx = (ax - prevAccelRef.current.ax) / dt;
+                      // const jy = (ay - prevAccelRef.current.ay) / dt;
+                      // currentJerkMag = Math.sqrt(jx * jx + jy * jy);
+                    }
+                    
+                    // Store current acceleration for next frame
+                    prevAccelRef.current = { ax, ay, t: time };
+                  }
+                  
+                  // Store current velocity for next frame
+                  prevVelocityRef.current = { vx, vy, t: time };
+                  
+                  // Pause detection logic
+                  if (currentSpeed < adaptiveVelocityThreshold) {
+                    if (!isPausedRef.current) {
+                      // Starting potential pause
+                      isPausedRef.current = true;
+                      pauseStartTimeRef.current = time;
+                    } else {
+                      // Continuing potential pause, check duration and stability
+                      const pauseDuration = time - (pauseStartTimeRef.current ?? time);
+                      
+                      if (pauseDuration > MIN_PAUSE_DURATION_MS) {
+                        // Check stability criteria
+                        const isStable = currentAccelMag < ACCEL_THRESHOLD_PAUSE; 
+                        // Removed jerk condition to simplify tuning based on acceleration only
+                        
+                        if (isStable) {
+                          // PAUSE CONFIRMED - finalize the current segment
+                          console.log(`Pause detected after ${pauseDuration.toFixed(0)}ms - segmenting at speed: ${currentSpeed.toFixed(4)}, accel: ${currentAccelMag.toFixed(4)}`);
+                          
+                          // Exclude points during the pause
+                          const pausePointCount = Math.round(MIN_PAUSE_DURATION_MS / (1000 / 30)); // Approximate based on 30fps
+                          const segmentToProcess = currentSegmentRef.current.slice(0, -pausePointCount);
+                          
+                          // Process the segment (if it has enough points)
+                          finalizeAndProcessSegment(segmentToProcess);
+                          
+                          // Clear for next segment
+                          currentSegmentRef.current = [];
+                          velocityHistoryRef.current = [];
+                          
+                          // Keep isPausedRef true until movement resumes
+                        }
+                      }
+                    }
+                  } else {
+                    // Movement detected
+                    if (isPausedRef.current) {
+                      // Reset pause state if we were paused
+                      isPausedRef.current = false;
+                      pauseStartTimeRef.current = null;
+                    }
+                  }
                 }
-              } else {
-                // Path too short or filter not ready, ensure timer is reset
-                timeBelowThresholdStartRef.current = null;
               }
             }
+          }
+        } else {
+          // No hand detected - if we've been recording, handle potential end of segment
+          if (isRecording && currentSegmentRef.current.length >= MIN_SEGMENT_LENGTH) {
+            console.log('Hand lost from view - processing current segment');
+            finalizeAndProcessSegment(currentSegmentRef.current);
+            currentSegmentRef.current = [];
+            velocityHistoryRef.current = [];
           }
         }
 
@@ -939,7 +1261,7 @@ const HandTracker: React.FC = () => {
         cancelAnimationFrame(animationFrameId);
       }
     };
-  }, [webcamRunning, handLandmarker, latestResults, isRecording, currentPath, handleStopDrawing]); // Added handleStopDrawing to dependencies
+  }, [webcamRunning, handLandmarker, latestResults, isRecording, currentPath, finalizeAndProcessSegment]); // Added finalizeAndProcessSegment, removed handleStopDrawing
 
   // --- Enable/Disable Webcam ---
   const enableCam = async () => {
@@ -953,10 +1275,12 @@ const HandTracker: React.FC = () => {
               videoRef.current.srcObject = stream;
               videoRef.current.play();
               
-              // After webcam is enabled, determine first digit locally
-              console.log("Webcam enabled, determining first digit...");
-              const firstDigit = determineNextDigit();
-              setDigitToDraw(firstDigit);
+              // After webcam is enabled, determine first digit only in training mode
+              if (isTrainingMode) {
+                console.log("Webcam enabled, determining first digit...");
+                const firstDigit = determineNextDigit();
+                setDigitToDraw(firstDigit);
+              }
           }
       } catch (err) {
           console.error("ERROR: getUserMedia() error:", err);
@@ -982,20 +1306,94 @@ const HandTracker: React.FC = () => {
       }
   };
 
-  // console.log("HandTracker Component Render - Loading state:", loading); // Commented out - reduces noise
+  // Prepare chart data
+  const speedChartData = useMemo(() => ({
+    datasets: [
+      {
+        label: 'Speed',
+        data: velocityHistory.map(p => ({ x: p.t, y: p.v })),
+        borderColor: batmanTheme.primaryAccent,
+        backgroundColor: `${batmanTheme.primaryAccent}33`,
+        tension: 0.4,
+      },
+    ],
+  }), [velocityHistory]);
+
+  const accelerationChartData = useMemo(() => ({
+    datasets: [
+      {
+        label: 'Acceleration',
+        data: accelerationHistory.map(p => ({ x: p.t, y: p.a })),
+        borderColor: batmanTheme.secondaryAccent,
+        backgroundColor: `${batmanTheme.secondaryAccent}33`,
+        tension: 0.4,
+      },
+    ],
+  }), [accelerationHistory]);
+
+  // Common chart options
+  const chartOptions: ChartOptions<'line'> = {
+    responsive: true,
+    maintainAspectRatio: false,
+    animation: {
+      duration: 0 // general animation time
+    },
+    scales: {
+      x: {
+        type: 'time',
+        time: {
+          unit: 'millisecond',
+          displayFormats: {
+            millisecond: 'mm:ss.SSS'
+          }
+        },
+        title: {
+          display: true,
+          text: 'Time (ms)',
+          color: batmanTheme.textPrimary
+        },
+        ticks: {
+          color: batmanTheme.textPrimary
+        }
+      },
+      y: {
+        beginAtZero: true,
+        title: {
+          display: true,
+          text: 'Value',
+          color: batmanTheme.textPrimary
+        },
+        ticks: {
+          color: batmanTheme.textPrimary
+        }
+      }
+    },
+    plugins: {
+      legend: {
+        position: 'top',
+        labels: {
+          color: batmanTheme.textPrimary
+        }
+      },
+      tooltip: {
+        mode: 'index',
+        intersect: false,
+      },
+    },
+  };
 
   return (
-    <div className="flex flex-col md:flex-row gap-4 p-4 bg-gray-900 text-gray-200 min-h-screen font-sans">
+    <div className="flex flex-col md:flex-row gap-4 p-4 bg-background text-text-primary min-h-screen font-sans">
       {/* Left column - Video/Canvas area */}
-      <div className="relative w-full md:w-1/2 lg:w-3/5 border border-gray-700 rounded-lg overflow-hidden shadow-md">
-        <h2 className="text-2xl font-semibold mb-6 text-white text-center py-3 border-b border-gray-800">Hand Tracking with MediaPipe</h2>
+      <div className="relative w-full md:w-1/2 lg:w-3/5 border border-border rounded-lg overflow-hidden shadow-md">
+        <h2 className="text-2xl font-semibold mb-6 text-text-titles text-center py-3 border-b border-border">Hand Tracking with MediaPipe</h2>
         
         <div className="px-4 mb-4">
           <div className="flex items-center mb-2">
             <span className={`inline-block h-3 w-3 rounded-full mr-2 ${
-              wsStatus === 'connected' ? 'bg-green-500' : 
-              wsStatus === 'connecting' ? 'bg-yellow-500' : 
-              wsStatus === 'error' ? 'bg-red-500' : 'bg-gray-500'
+              wsStatus === 'connected' ? 'bg-primary-accent' : 
+              wsStatus === 'connecting' ? 'bg-secondary-accent' : 
+              wsStatus === 'error' ? 'bg-red-500' : 'bg-border'
             }`}></span>
             <span className="text-sm font-medium">
               WebSocket: {wsStatus}
@@ -1003,29 +1401,48 @@ const HandTracker: React.FC = () => {
           </div>
           
           <div className="mb-6 text-center h-24 flex items-center justify-center">
-            {digitToDraw !== null ? (
-              <p className="text-center text-5xl font-bold mb-2 text-blue-400 bg-gray-800/60 py-3 px-6 rounded-lg shadow-inner">
-                Please Draw: <span className="text-green-400">{digitToDraw}</span>
-              </p>
-            ) : (
-              webcamRunning ? (
-                <div className="flex flex-col items-center">
-                  <div className="inline-block animate-spin rounded-full h-8 w-8 border-t-2 border-b-2 border-blue-500 mb-2"></div>
-                  <p className="text-gray-400">Fetching next digit...</p>
-                </div>
-              ) : (
-                <p className="text-lg text-gray-400 p-2">
-                  Enable webcam to start.
+            {isTrainingMode ? (
+              digitToDraw !== null ? (
+                <p className="text-center text-5xl font-bold mb-2 text-text-titles bg-surface py-3 px-6 rounded-lg shadow-inner">
+                  Please Draw: <span className="text-primary-accent">{digitToDraw}</span>
                 </p>
+              ) : (
+                webcamRunning ? (
+                  <div className="flex flex-col items-center">
+                    <div className="inline-block animate-spin rounded-full h-8 w-8 border-t-2 border-b-2 border-primary-accent mb-2"></div>
+                    <p className="text-border">Fetching next digit...</p>
+                  </div>
+                ) : (
+                  <p className="text-lg text-border p-2">
+                    Enable webcam to start.
+                  </p>
+                )
               )
+            ) : (
+              // Prediction Mode UI
+              <div className="text-center my-4 h-10">
+                {!isTrainingMode && (
+                  <div>
+                    {prediction !== null ? (
+                      <p className="text-3xl font-bold text-primary-accent">
+                        Predicted Digit: <span className="text-text-titles">{prediction}</span>
+                      </p>
+                    ) : (
+                      <p className="text-lg text-text-primary">
+                        Draw a digit to get a prediction.
+                      </p>
+                    )}
+                  </div>
+                )}
+              </div>
             )}
           </div>
         </div>
         
         {loading ? (
           <div className="text-center py-12">
-            <div className="inline-block animate-spin rounded-full h-12 w-12 border-t-2 border-b-2 border-blue-500 mb-4"></div>
-            <p className="text-lg text-gray-300">Loading hand tracking model...</p>
+            <div className="inline-block animate-spin rounded-full h-12 w-12 border-t-2 border-b-2 border-primary-accent mb-4"></div>
+            <p className="text-lg text-text-primary">Loading hand tracking model...</p>
           </div>
         ) : (
           <div className="relative mx-auto">
@@ -1056,7 +1473,7 @@ const HandTracker: React.FC = () => {
               <button 
                 onClick={enableCam} 
                 disabled={!handLandmarker}
-                className="w-full px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-md font-semibold transition duration-150 ease-in-out focus:outline-hidden focus:ring-3 focus:ring-offset-2 focus:ring-offset-gray-800 focus:ring-blue-500 disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-x-2"
+                className="w-full px-4 py-2 bg-primary-accent hover:bg-secondary-accent text-background rounded-md font-semibold transition duration-150 ease-in-out focus:outline-hidden focus:ring-3 focus:ring-offset-2 focus:ring-offset-background focus:ring-primary-accent disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-x-2"
               >
                 <VideoCameraIcon className="h-5 w-5" />
                 Enable Webcam
@@ -1064,7 +1481,7 @@ const HandTracker: React.FC = () => {
             ) : (
               <button 
                 onClick={disableCam}
-                className="w-full px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-md font-semibold transition duration-150 ease-in-out focus:outline-hidden focus:ring-3 focus:ring-offset-2 focus:ring-offset-gray-800 focus:ring-blue-500 flex items-center justify-center gap-x-2"
+                className="w-full px-4 py-2 bg-primary-accent hover:bg-secondary-accent text-background rounded-md font-semibold transition duration-150 ease-in-out focus:outline-hidden focus:ring-3 focus:ring-offset-2 focus:ring-offset-background focus:ring-primary-accent flex items-center justify-center gap-x-2"
               >
                 <VideoCameraSlashIcon className="h-5 w-5" />
                 Disable Webcam
@@ -1073,18 +1490,18 @@ const HandTracker: React.FC = () => {
           </div>
 
           <div className="mt-6 text-center">
-            <p className="text-center font-medium mb-2 text-sm text-gray-400">
+            <p className="text-center font-medium mb-2 text-sm text-border">
               {isRecording ? 'Status: ' : ''}
-              <span className={isRecording ? 'text-yellow-400 font-bold' : 'text-gray-500'}>
+              <span className={isRecording ? 'text-primary-accent font-bold' : 'text-border'}>
                 {isRecording ? 'RECORDING' : ''}
               </span>
             </p>
             
-            {predictedDigit !== null && (
-              <h2 className="text-center text-2xl font-semibold mt-3 bg-gray-800 inline-block px-6 py-2 rounded-lg">
-                Detected: <span className="text-blue-400 font-bold">{String(predictedDigit)}</span>
+            {isTrainingMode && predictedDigit !== null && (
+              <h2 className="text-center text-2xl font-semibold mt-3 bg-surface inline-block px-6 py-2 rounded-lg">
+                Detected: <span className="text-primary-accent font-bold">{String(predictedDigit)}</span>
                 {predictionConfidence !== null && 
-                  <span className="text-sm ml-2 text-gray-400">
+                  <span className="text-sm ml-2 text-border">
                     ({(predictionConfidence * 100).toFixed(1)}%)
                   </span>
                 }
@@ -1095,59 +1512,138 @@ const HandTracker: React.FC = () => {
       </div>
       
       {/* Right column - Controls */}
-      <div className="w-full md:w-1/2 lg:w-2/5 bg-gray-800 p-6 rounded-lg shadow-md">
-        <h3 className="text-2xl font-semibold mb-6 text-white border-b border-gray-700 pb-3">Controls</h3>
+      <div className="w-full md:w-1/2 lg:w-2/5 bg-surface p-6 rounded-lg shadow-md">
+        <h3 className="text-2xl font-semibold mb-6 text-text-titles border-b border-border pb-3">Controls</h3>
         
-        <div className="flex flex-col space-y-4">
+        {/* Training Mode Toggle */}
+        <button
+          onClick={() => setIsTrainingMode(!isTrainingMode)}
+          className={`w-full p-3 rounded-md mb-4 text-center font-medium transition-colors ${
+            isTrainingMode
+              ? 'bg-secondary-accent text-background' // Style for ON
+              : 'bg-surface border border-border hover:bg-border text-text-primary' // Style for OFF
+          }`}
+        >
+          {isTrainingMode ? 'Training Mode: ON' : 'Training Mode: OFF'}
+        </button>
+        
+        <div className="flex flex-col space-y-4 mb-4">
           <button 
             onClick={handleStartDrawing} 
-            disabled={!webcamRunning || isRecording || loading || digitToDraw === null} 
-            className="w-full px-4 py-2 bg-green-700 hover:bg-green-600 text-white rounded-md font-semibold transition duration-150 ease-in-out focus:outline-hidden focus:ring-3 focus:ring-offset-2 focus:ring-offset-gray-800 focus:ring-green-500 disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-x-2"
+            disabled={!webcamRunning || isRecording || loading || (isTrainingMode && digitToDraw === null)} 
+            className="w-full px-4 py-2 bg-surface hover:bg-border text-text-primary border border-primary-accent rounded-md font-semibold transition duration-150 ease-in-out focus:outline-hidden focus:ring-3 focus:ring-offset-2 focus:ring-offset-background focus:ring-primary-accent disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-x-2"
           >
-            <PlayIcon className="h-5 w-5" />
+            <PlayIcon className="h-5 w-5 text-primary-accent" />
             Start Drawing
           </button>
           
           <button 
             onClick={handleStopDrawing} 
             disabled={!webcamRunning || !isRecording || loading} 
-            className="w-full px-4 py-2 bg-yellow-600 hover:bg-yellow-500 text-white rounded-md font-semibold transition duration-150 ease-in-out focus:outline-hidden focus:ring-3 focus:ring-offset-2 focus:ring-offset-gray-800 focus:ring-yellow-400 disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-x-2"
+            className="w-full px-4 py-2 bg-surface hover:bg-border text-text-primary border border-secondary-accent rounded-md font-semibold transition duration-150 ease-in-out focus:outline-hidden focus:ring-3 focus:ring-offset-2 focus:ring-offset-background focus:ring-secondary-accent disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-x-2"
           >
-            <StopIcon className="h-5 w-5" />
+            <StopIcon className="h-5 w-5 text-secondary-accent" />
             Stop Drawing
           </button>
           
           <button 
             onClick={handleResetDrawing} 
             disabled={currentPath.length === 0 || loading} 
-            className="w-full px-4 py-2 bg-red-700 hover:bg-red-600 text-white rounded-md font-semibold transition duration-150 ease-in-out focus:outline-hidden focus:ring-3 focus:ring-offset-2 focus:ring-offset-gray-800 focus:ring-red-500 disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-x-2"
+            className="w-full px-4 py-2 bg-surface hover:bg-border text-text-primary border border-optional-accent rounded-md font-semibold transition duration-150 ease-in-out focus:outline-hidden focus:ring-3 focus:ring-offset-2 focus:ring-offset-background focus:ring-optional-accent disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-x-2"
           >
-            <ArrowPathIcon className="h-5 w-5" />
+            <ArrowPathIcon className="h-5 w-5 text-optional-accent" />
             Reset Drawing
           </button>
         </div>
         
-        <div className="mt-10 pt-4 border-t border-gray-700">
-          <h4 className="text-lg font-medium mb-4 text-gray-300">How to Use</h4>
-          <ol className="list-decimal list-inside space-y-2 text-gray-400">
-            <li>Enable your webcam</li>
-            <li>Wait for a digit prompt to appear</li>
-            <li>Position your index finger in view of the camera</li>
-            <li>Click &quot;Start Drawing&quot; and draw the prompted digit in the air</li>
-            <li>Drawing will auto-stop when you finish, or click &quot;Stop Drawing&quot;</li>
-            <li>After each drawing, a new digit will be automatically prompted</li>
-          </ol>
-          
-          <div className="mt-6 p-4 bg-gray-900 rounded-md">
-            <h5 className="text-md font-medium mb-2 text-gray-300">Tips</h5>
-            <ul className="list-disc list-inside text-sm text-gray-400">
-              <li>Draw large, clear digits</li>
-              <li>Keep your hand in the camera view at all times</li>
-              <li>Position yourself in good lighting</li>
-              <li>Hold your position after drawing for automatic stopping</li>
-              <li>After completing all 10 digits, view your data in the Data Manager</li>
-            </ul>
+        <div className="mt-6 pt-4 border-t border-border">
+          <div className="flex justify-between items-center mb-3">
+            <h4 className="text-lg font-medium text-text-titles">Kinematic Dashboard</h4>
+            <button
+              onClick={() => setShowCharts(!showCharts)}
+              className="px-3 py-1 text-sm rounded bg-surface hover:bg-border text-text-primary border border-border"
+              title="Toggle Real-time Kinematic Charts"
+            >
+              {showCharts ? 'Hide Charts' : 'Show Charts'}
+            </button>
           </div>
+          
+          {showCharts && (
+            <div className="mt-4">
+              {/* Chart containers */}
+              <div className="mb-4">
+                <div className="h-40 w-full mb-4 bg-background p-2 rounded-lg">
+                  <Line options={chartOptions} data={speedChartData} />
+                </div>
+                <div className="h-40 w-full mb-4 bg-background p-2 rounded-lg">
+                  <Line options={chartOptions} data={accelerationChartData} />
+                </div>
+              </div>
+              
+              {/* Kinematic Data Display */}
+              <div className="bg-background rounded-lg p-4 shadow-inner">
+                <div className="grid grid-cols-2 gap-4">
+                  <div className="bg-surface p-3 rounded-md">
+                    <h5 className="text-sm font-medium text-text-titles mb-1">Current Speed</h5>
+                    <p className="text-xl font-bold text-primary-accent">
+                      {currentSpeed ? currentSpeed.toFixed(4) : '0.0000'}
+                    </p>
+                  </div>
+                  
+                  <div className="bg-surface p-3 rounded-md">
+                    <h5 className="text-sm font-medium text-text-titles mb-1">Current Acceleration</h5>
+                    <p className="text-xl font-bold text-secondary-accent">
+                      {currentAcceleration ? currentAcceleration.toFixed(4) : '0.0000'}
+                    </p>
+                  </div>
+                </div>
+                
+                <div className="mt-4">
+                  <h5 className="text-sm font-medium text-text-titles mb-2">History Stats</h5>
+                  <div className="grid grid-cols-2 gap-2 text-sm">
+                    <div>
+                      <p className="text-text-primary">
+                        <span className="font-medium">Velocity Points:</span> {velocityHistory.length}
+                      </p>
+                      {velocityHistory.length > 0 && (
+                        <p className="text-text-primary">
+                          <span className="font-medium">Max Speed:</span> {Math.max(...velocityHistory.map(v => v.v)).toFixed(4)}
+                        </p>
+                      )}
+                    </div>
+                    <div>
+                      <p className="text-text-primary">
+                        <span className="font-medium">Accel Points:</span> {accelerationHistory.length}
+                      </p>
+                      {accelerationHistory.length > 0 && (
+                        <p className="text-text-primary">
+                          <span className="font-medium">Max Accel:</span> {Math.max(...accelerationHistory.map(a => a.a)).toFixed(4)}
+                        </p>
+                      )}
+                    </div>
+                  </div>
+                </div>
+                
+                <div className="mt-4">
+                  <h5 className="text-sm font-medium text-text-titles mb-2">Tracking Status</h5>
+                  <div className="grid grid-cols-2 gap-2 text-sm">
+                    <p className="text-text-primary">
+                      <span className="font-medium">Path Points:</span> {currentPath.length}
+                    </p>
+                    <p className="text-text-primary">
+                      <span className="font-medium">Segment Points:</span> {currentSegmentRef.current.length}
+                    </p>
+                    <p className="text-text-primary">
+                      <span className="font-medium">Paused:</span> {isPausedRef.current ? 'Yes' : 'No'}
+                    </p>
+                    <p className="text-text-primary">
+                      <span className="font-medium">Recording:</span> {isRecording ? 'Yes' : 'No'}
+                    </p>
+                  </div>
+                </div>
+              </div>
+            </div>
+          )}
         </div>
       </div>
     </div>

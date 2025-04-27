@@ -126,7 +126,7 @@ const PathThumbnail = ({
 
     // Draw the path
     ctx.beginPath();
-    ctx.strokeStyle = "#FFFFFF";
+    ctx.strokeStyle = "#FFD700"; // Changed to Batman gold (primary-accent)
     ctx.lineWidth = 3;
     ctx.lineCap = "round";
     ctx.lineJoin = "round";
@@ -147,7 +147,7 @@ const PathThumbnail = ({
 
     // Draw a selection border if selected
     if (isSelected) {
-      ctx.strokeStyle = "#3B82F6";
+      ctx.strokeStyle = "#FFD700"; // Batman gold color for selection
       ctx.lineWidth = 3;
       ctx.strokeRect(0, 0, canvas.width, canvas.height);
     }
@@ -156,18 +156,18 @@ const PathThumbnail = ({
   return (
     <div 
       className={`relative border rounded-sm overflow-hidden cursor-pointer ${
-        isSelected ? "border-blue-500 bg-blue-50" : "border-gray-300 hover:border-gray-400"
+        isSelected ? "border-primary-accent bg-surface" : "border-border hover:border-primary-accent"
       }`}
       onClick={onClick}
     >
-      <canvas ref={canvasRef} width={150} height={150} className="w-full h-full bg-gray-800 -scale-x-100" />
+      <canvas ref={canvasRef} width={150} height={150} className="w-full h-full bg-background -scale-x-100" />
       {isSelected && (
-        <div className="absolute top-2 right-2 bg-blue-500 rounded-full p-1">
-          <CheckIcon className="w-4 h-4 text-white" />
+        <div className="absolute top-2 right-2 bg-primary-accent rounded-full p-1">
+          <CheckIcon className="w-4 h-4 text-background" />
         </div>
       )}
-      <div className="absolute bottom-0 left-0 right-0 bg-black/50 text-white text-xs p-1">
-        <span className="mr-2">Label: {drawing.label}</span>
+      <div className="absolute bottom-0 left-0 right-0 bg-surface/80 text-text-primary text-xs p-1">
+        <span className="mr-2">Label: <span className="text-primary-accent">{drawing.label}</span></span>
         <span>{new Date(drawing.timestamp).toLocaleString()}</span>
       </div>
     </div>
@@ -374,21 +374,21 @@ export default function DataManager() {
   };
 
   return (
-    <div className="container mx-auto p-4 max-w-6xl">
-      <h1 className="text-2xl font-bold mb-4">Drawing Data Manager</h1>
+    <div className="container mx-auto p-4 max-w-6xl bg-background text-text-primary">
+      <h1 className="text-2xl font-bold mb-4 text-text-titles">Drawing Data Manager</h1>
       
       {/* Statistics Section */}
-      <div className="mb-6 p-4 bg-gray-800 rounded-lg">
-        <h2 className="text-xl font-semibold text-white mb-3">Statistics</h2>
-        <p className="text-gray-200 mb-2">Total Drawings: <span className="font-semibold">{totalCount}</span></p>
+      <div className="mb-6 p-4 bg-surface rounded-lg border border-border">
+        <h2 className="text-xl font-semibold text-text-titles mb-3">Statistics</h2>
+        <p className="text-text-primary mb-2">Total Drawings: <span className="font-semibold text-primary-accent">{totalCount}</span></p>
         
         <div className="mt-3">
-          <h3 className="text-sm font-medium text-gray-300 mb-2">Count per digit:</h3>
+          <h3 className="text-sm font-medium text-text-primary mb-2">Count per digit:</h3>
           <div className="grid grid-cols-5 gap-3 md:grid-cols-10">
             {Object.entries(countsPerLabel).map(([label, count]) => (
-              <div key={label} className="bg-gray-700 rounded-lg p-3 text-center">
-                <span className="text-xl font-bold text-white block">{label}</span>
-                <span className="text-sm text-gray-300">{count} drawings</span>
+              <div key={label} className="bg-background rounded-lg p-3 text-center border border-border">
+                <span className="text-xl font-bold text-primary-accent block">{label}</span>
+                <span className="text-sm text-text-primary">{count} drawings</span>
               </div>
             ))}
           </div>
@@ -400,21 +400,21 @@ export default function DataManager() {
         <div className="space-x-2">
           <button
             onClick={selectAll}
-            className="px-4 py-2 bg-gray-900 hover:bg-gray-800 rounded-sm"
+            className="px-4 py-2 bg-surface hover:bg-border border border-border rounded-sm text-text-primary transition-colors duration-150"
             disabled={drawings.length === 0}
           >
             Select All
           </button>
           <button
             onClick={clearSelection}
-            className="px-4 py-2 bg-gray-900 hover:bg-gray-800 rounded-sm"
+            className="px-4 py-2 bg-surface hover:bg-border border border-border rounded-sm text-text-primary transition-colors duration-150"
             disabled={selectedIds.size === 0}
           >
             Clear Selection
           </button>
           <button
             onClick={handleExportJson}
-            className="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-sm flex items-center gap-2"
+            className="px-4 py-2 bg-primary-accent hover:bg-secondary-accent text-background rounded-sm flex items-center gap-2 font-medium transition-colors duration-150"
             disabled={drawings.length === 0}
           >
             <ArrowDownTrayIcon className="w-5 h-5" />
@@ -424,7 +424,7 @@ export default function DataManager() {
         
         <button
           onClick={deleteSelected}
-          className="px-4 py-2 bg-red-500 hover:bg-red-600 text-white rounded-sm flex items-center gap-2"
+          className="px-4 py-2 bg-red-600 hover:bg-red-700 text-white rounded-sm flex items-center gap-2 font-medium transition-colors duration-150"
           disabled={selectedIds.size === 0}
         >
           <TrashIcon className="w-5 h-5" />
@@ -435,15 +435,15 @@ export default function DataManager() {
       {/* Loading state */}
       {isLoading && (
         <div className="flex justify-center items-center h-64">
-          <div className="animate-spin rounded-full h-12 w-12 border-t-2 border-b-2 border-blue-500"></div>
+          <div className="animate-spin rounded-full h-12 w-12 border-t-2 border-b-2 border-primary-accent"></div>
         </div>
       )}
       
       {/* Empty state */}
       {!isLoading && drawings.length === 0 && (
-        <div className="text-center py-12 bg-gray-50 rounded-sm">
-          <p className="text-gray-500 text-lg mb-2">No drawings found</p>
-          <p className="text-gray-400">Drawings created with the hand tracker will appear here</p>
+        <div className="text-center py-12 bg-surface rounded-sm border border-border">
+          <p className="text-text-primary text-lg mb-2">No drawings found</p>
+          <p className="text-border">Drawings created with the hand tracker will appear here</p>
         </div>
       )}
       
@@ -458,8 +458,8 @@ export default function DataManager() {
             
             return (
               <div key={digit} className="pt-4">
-                <h3 className="text-xl font-semibold mb-4 border-b border-gray-700 pb-2">
-                  Digit: {digit} <span className="text-gray-400 text-base">({countsPerLabel[digit]} drawings)</span>
+                <h3 className="text-xl font-semibold mb-4 border-b border-border pb-2 text-text-titles">
+                  Digit: {digit} <span className="text-text-primary text-base">({countsPerLabel[digit]} drawings)</span>
                 </h3>
                 
                 <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 gap-4">
