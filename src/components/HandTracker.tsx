@@ -35,6 +35,7 @@ ChartJS.register(
 
 interface Point { x: number; y: number; z?: number; } // Define a Point type
 type WsStatus = 'disconnected' | 'connecting' | 'connected' | 'error';
+type DrawingPhase = 'IDLE' | 'DRAWING' | 'PAUSED';
 
 // Kalman Filter Parameters - Tunable constants
 const PROCESS_NOISE_Q = 0.01; // Process noise - how much we expect the motion model to be incorrect (smaller = smoother but more laggy)
@@ -46,17 +47,20 @@ const DT = 1/30; // Time delta between frames in seconds - 30 FPS assumption
 const CHART_UPDATE_THROTTLE_MS = 200; // Increased for smoother performance
 
 // --- Segmentation Parameters (Tunable) ---
-const MIN_PAUSE_DURATION_MS = 300; // Increased to require longer pause
-const ACCEL_THRESHOLD_PAUSE = 15.0; // Decreased for stricter stability check (NEEDS EMPIRICAL TUNING!)
+const MIN_PAUSE_DURATION_MS = 200; // Minimum time to consider a pause
 // const JERK_THRESHOLD_PAUSE = 0.0001; // Optional: Max jerk magnitude for stability (disabled for simplification)
 const ADAPTIVE_VEL_THRESHOLD_RATIO = 0.25; // Increased sensitivity for low velocity detection
 const ADAPTIVE_VEL_WINDOW_MS = 500; // Time window (ms) to calculate peak velocity over
+const VELOCITY_HIGH_THRESHOLD_MULTIPLIER = 1.5; // Require higher speed to start drawing after a pause
+const FRAME_RATE = 30; // Estimated frame rate for calculations
 const MIN_SEGMENT_LENGTH = 10; // Minimum number of points for a segment to be processed
+const ACCELERATION_STABILITY_THRESHOLD = 200; // pixels/s²
 
 // Path trimming constants
 const TRIM_MIN_PATH_LENGTH = 5; // Min points needed to attempt trimming
 const TRIM_WINDOW_SIZE = 4;      // How many points to average over
 const TRIM_VARIANCE_THRESHOLD = 0.00001; // Threshold for variance detection (needs tuning)
+const MIN_DT_MS = 1; // Minimum time difference (ms) for calculations
 
 // Local storage key for saving collected data
 const LOCAL_STORAGE_KEY = 'airboard_collected_data';
@@ -488,7 +492,8 @@ const HandTracker: React.FC = () => {
   const [predictionConfidence, setPredictionConfidence] = useState<number | null>(null);
   const [isTrainingMode, setIsTrainingMode] = useState<boolean>(true);
   const [prediction, setPrediction] = useState<number | null>(null);
-  const [showCharts, setShowCharts] = useState<boolean>(false); // Start with charts hidden
+  const [showCharts, setShowCharts] = useState<boolean>(false);
+  const [drawingPhase, setDrawingPhase] = useState<DrawingPhase>('IDLE');
   const [completedSegments, setCompletedSegments] = useState<Array<Array<{ x: number; y: number; z?: number; t: number }>>>([]);
   
   // Kinematic data state
@@ -499,19 +504,18 @@ const HandTracker: React.FC = () => {
   
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const requestRef = useRef<number | null>(null); // For requestAnimationFrame handle
-  const kalmanFilterRef = useRef<KalmanFilter2D | null>(null); // Kalman filter instance
-  const lastFrameTimeRef = useRef<number>(0); // Track last frame time for dt calculation
-  const timeBelowThresholdStartRef = useRef<number | null>(null); // Track when speed drops below threshold
-  const lastChartUpdateTimeRef = useRef<number>(0); // For throttling chart updates
+  const requestRef = useRef<number | null>(null);
+  const kalmanFilterRef = useRef<KalmanFilter2D | null>(null);
+  const lastFrameTimeRef = useRef<number>(0);
+  const timeBelowThresholdStartRef = useRef<number | null>(null);
+  const lastChartUpdateTimeRef = useRef<number>(0);
+  const potentialPauseStartTimeRef = useRef<number | null>(null);
   
   // Refs for advanced path segmentation
-  const isPausedRef = useRef<boolean>(false);
-  const pauseStartTimeRef = useRef<number | null>(null);
-  const velocityHistoryRef = useRef<Array<{ t: number; v: number }>>([]); // For adaptive threshold
-  const currentSegmentRef = useRef<Array<{ x: number; y: number; z?: number; t: number }>>([]); // Holds points for the current character/segment
-  const prevVelocityRef = useRef<{ vx: number; vy: number; t: number } | null>(null); // For acceleration calculation
-  const prevAccelRef = useRef<{ ax: number; ay: number; t: number } | null>(null); // For jerk calculation (optional)
+  const velocityHistoryRef = useRef<Array<{ t: number; v: number }>>([]);
+  const currentSegmentRef = useRef<Array<{ x: number; y: number; z?: number; t: number }>>([]);
+  const prevVelocityRef = useRef<{ vx: number; vy: number; t: number } | null>(null);
+  const prevAccelRef = useRef<{ ax: number; ay: number; t: number } | null>(null);
 
   // --- Basic Drawing Utility ---
   const drawLandmarks = (ctx: CanvasRenderingContext2D, landmarks: NormalizedLandmark[]) => {
@@ -707,6 +711,7 @@ const HandTracker: React.FC = () => {
     // Check if segment has enough points
     if (segmentPoints.length < MIN_SEGMENT_LENGTH) {
       console.log(`Segment too short (${segmentPoints.length} points), ignoring.`);
+      setDrawingPhase('IDLE');
       return;
     }
 
@@ -752,10 +757,9 @@ const HandTracker: React.FC = () => {
     // Don't end the session - just clear the current segment ref to start a new segment
     currentSegmentRef.current = [];
     
-    // Reset pause state after segment processing
-    isPausedRef.current = false;
-    pauseStartTimeRef.current = null;
-    console.log("Segment finalized, pause state reset.");
+    // Set the drawing phase back to IDLE
+    setDrawingPhase('IDLE');
+    console.log("Segment finalized, Phase set to IDLE.");
   }, [
     isSessionActive,
     isTrainingMode,
@@ -765,8 +769,6 @@ const HandTracker: React.FC = () => {
     setPrediction,
     ws,
     submitDrawing,
-    isPausedRef,
-    pauseStartTimeRef,
     currentSegmentRef
   ]);
 
@@ -910,6 +912,7 @@ const HandTracker: React.FC = () => {
     setPredictedDigit(null);
     setPredictionConfidence(null);
     setPrediction(null); // Clear any previous prediction
+    setDrawingPhase('IDLE'); // Ensure we start in IDLE phase
     setIsSessionActive(true); // Activate the session
     console.log("handleStartSession called: isSessionActive set to true");
     
@@ -917,8 +920,7 @@ const HandTracker: React.FC = () => {
     kalmanFilterRef.current = null;
     
     // Reset segmentation refs
-    isPausedRef.current = false;
-    pauseStartTimeRef.current = null;
+    potentialPauseStartTimeRef.current = null;
     velocityHistoryRef.current = [];
     currentSegmentRef.current = [];
     prevVelocityRef.current = null;
@@ -942,6 +944,7 @@ const HandTracker: React.FC = () => {
       finalizeAndProcessSegment([...currentSegmentRef.current]);
     }
     
+    setDrawingPhase('IDLE'); // Reset drawing phase
     setIsSessionActive(false);
     console.log("handleEndSession called: isSessionActive set to false");
     
@@ -957,6 +960,7 @@ const HandTracker: React.FC = () => {
     setPredictedDigit(null);
     setPredictionConfidence(null);
     setCompletedSegments([]); // Clear completed segments
+    setDrawingPhase('IDLE'); // Reset drawing phase
     setIsSessionActive(false); // Explicitly stop the session
     console.log("handleResetDrawing called: isSessionActive set to false");
     
@@ -970,8 +974,7 @@ const HandTracker: React.FC = () => {
     kalmanFilterRef.current = null;
     
     // Reset segmentation refs
-    isPausedRef.current = false;
-    pauseStartTimeRef.current = null;
+    potentialPauseStartTimeRef.current = null;
     velocityHistoryRef.current = [];
     currentSegmentRef.current = [];
     prevVelocityRef.current = null;
@@ -1044,34 +1047,44 @@ const HandTracker: React.FC = () => {
               t: time,       // Store current time
             };
             
-            // If we're in a session, process the point for path segmentation
+            // Always update the visual path if session is active
             if (isSessionActive) {
               // Add the filtered point to the visual path for display
               setCurrentPath(prevPath => [...prevPath, { x: filteredX, y: filteredY, z: indexTip.z }]);
               
-              console.log(`Loop Check: isSessionActive=${isSessionActive}, isPausedRef=${isPausedRef.current}`);
+              // Calculate velocity, acceleration and thresholds
+              let currentSpeedCalc = 0;
+              let currentAccelMagCalc = 0;
+              let velocityLowThreshold = 0;
+              let velocityHighThreshold = 0;
               
-              // Calculate velocity if we have at least two points
-              if (currentSegmentRef.current.length >= 2) {
-                const currentPoint = filteredPoint;
-                const prevPoint = currentSegmentRef.current[currentSegmentRef.current.length - 2];
-                const dt = (currentPoint.t - prevPoint.t) / 1000; // Convert to seconds
+              // Calculate velocity if we have previous point
+              if (prevVelocityRef.current) {
+                const dt = (filteredPoint.t - prevVelocityRef.current.t) / 1000; // Convert to seconds
+                let vx = 0, vy = 0;
                 
-                if (dt > 0) { // Avoid division by zero
-                  // Calculate velocity components
-                  const vx = (currentPoint.x - prevPoint.x) / dt;
-                  const vy = (currentPoint.y - prevPoint.y) / dt;
-                  const currentSpeed = Math.sqrt(vx * vx + vy * vy);
+                if (dt * 1000 >= MIN_DT_MS) { // Check using milliseconds
+                  vx = (filteredPoint.x - prevVelocityRef.current.vx) / dt;
+                  vy = (filteredPoint.y - prevVelocityRef.current.vy) / dt;
+                  currentSpeedCalc = Math.sqrt(vx * vx + vy * vy);
+                  
+                  // Sanity check result
+                  if (!Number.isFinite(currentSpeedCalc)) {
+                    console.warn("Calculated non-finite speed, resetting to 0. dt:", dt);
+                    currentSpeedCalc = 0;
+                    vx = 0;
+                    vy = 0;
+                  }
                   
                   // Update current speed state
-                  setCurrentSpeed(currentSpeed);
+                  setCurrentSpeed(currentSpeedCalc);
                   
                   // Add to velocity history with throttling
-                  const now = time;
+                  const now = filteredPoint.t;
                   if (now - lastChartUpdateTimeRef.current > CHART_UPDATE_THROTTLE_MS) {
                     // Add to velocity history
                     setVelocityHistory(prev => {
-                      const newHistory = [...prev, { t: time, vx, vy, v: currentSpeed }];
+                      const newHistory = [...prev, { t: filteredPoint.t, vx, vy, v: currentSpeedCalc }];
                       // Trim history if it exceeds max length
                       return newHistory.length > MAX_KINEMATIC_HISTORY 
                         ? newHistory.slice(-MAX_KINEMATIC_HISTORY) 
@@ -1079,126 +1092,129 @@ const HandTracker: React.FC = () => {
                     });
                     
                     // Calculate acceleration if we have previous velocity
-                    if (prevVelocityRef.current && dt > 0) {
-                      const ax = (vx - prevVelocityRef.current.vx) / dt;
-                      const ay = (vy - prevVelocityRef.current.vy) / dt;
-                      const currentAccelMag = Math.sqrt(ax * ax + ay * ay);
+                    if (prevVelocityRef.current) {
+                      const dtAccel = dt; // Reuse same dt for acceleration calculation
+                      let ax = 0, ay = 0;
                       
-                      // Update current acceleration state
-                      setCurrentAcceleration(currentAccelMag);
-                      
-                      // Add to acceleration history
-                      setAccelerationHistory(prev => {
-                        const newHistory = [...prev, { t: time, ax, ay, a: currentAccelMag }];
-                        // Trim history if it exceeds max length
-                        return newHistory.length > MAX_KINEMATIC_HISTORY 
-                          ? newHistory.slice(-MAX_KINEMATIC_HISTORY) 
-                          : newHistory;
-                      });
-                      
-                      // Update the last chart update time
-                      lastChartUpdateTimeRef.current = now;
+                      if (dtAccel * 1000 >= MIN_DT_MS) {
+                        ax = (vx - prevVelocityRef.current.vx) / dtAccel;
+                        ay = (vy - prevVelocityRef.current.vy) / dtAccel;
+                        currentAccelMagCalc = Math.sqrt(ax * ax + ay * ay);
+                        
+                        // Sanity check result
+                        if (!Number.isFinite(currentAccelMagCalc)) {
+                          console.warn("Calculated non-finite acceleration, resetting to 0. dtAccel:", dtAccel);
+                          currentAccelMagCalc = 0;
+                          ax = 0;
+                          ay = 0;
+                        }
+                        
+                        // Update current acceleration state
+                        setCurrentAcceleration(currentAccelMagCalc);
+                        
+                        // Add to acceleration history
+                        setAccelerationHistory(prev => {
+                          const newHistory = [...prev, { t: filteredPoint.t, ax, ay, a: currentAccelMagCalc }];
+                          // Trim history if it exceeds max length
+                          return newHistory.length > MAX_KINEMATIC_HISTORY 
+                            ? newHistory.slice(-MAX_KINEMATIC_HISTORY) 
+                            : newHistory;
+                        });
+                        
+                        // Update the last chart update time
+                        lastChartUpdateTimeRef.current = now;
+                        
+                        // Store current acceleration for next frame
+                        prevAccelRef.current = { ax, ay, t: filteredPoint.t };
+                      } else {
+                        console.warn("dt too small for acceleration calculation:", dtAccel);
+                        setCurrentAcceleration(0);
+                      }
                     }
                   }
                   
                   // Store in velocity history for adaptive thresholding - always do this regardless of throttling
-                  velocityHistoryRef.current.push({ t: time, v: currentSpeed });
+                  velocityHistoryRef.current.push({ t: filteredPoint.t, v: currentSpeedCalc });
                   
                   // Trim velocity history to only include recent points
-                  const cutoffTime = time - ADAPTIVE_VEL_WINDOW_MS;
+                  const cutoffTime = filteredPoint.t - ADAPTIVE_VEL_WINDOW_MS;
                   velocityHistoryRef.current = velocityHistoryRef.current.filter(item => item.t >= cutoffTime);
                   
-                  // Calculate adaptive velocity threshold based on peak speed
+                  // Calculate thresholds
                   const peakSpeed = Math.max(...velocityHistoryRef.current.map(item => item.v), 0.001); // Avoid zero
-                  const adaptiveVelocityThreshold = peakSpeed * ADAPTIVE_VEL_THRESHOLD_RATIO;
+                  velocityLowThreshold = peakSpeed * ADAPTIVE_VEL_THRESHOLD_RATIO;
+                  velocityHighThreshold = velocityLowThreshold * VELOCITY_HIGH_THRESHOLD_MULTIPLIER;
                   
-                  // Require speed to be definitively above threshold to buffer points
-                  const speedThresholdForBuffering = adaptiveVelocityThreshold * 1.2; // Require speed > 120% of pause threshold
-                  
-                  // MODIFIED CONDITION: Only add points if:
-                  // 1. Not paused, AND
-                  // 2. Either starting a new segment OR moving definitively above the threshold
-                  if (!isPausedRef.current && (currentSegmentRef.current.length === 0 || currentSpeed > speedThresholdForBuffering)) {
-                    // Only add filtered point to segment if it meets our criteria
-                    currentSegmentRef.current.push(filteredPoint);
+                  // Calculate acceleration if we have previous velocity - moved to chart update section
+                  // Store current acceleration for next frame
+                  if (!prevAccelRef.current) {
+                    // Initialize acceleration reference if it doesn't exist
+                    prevAccelRef.current = { ax: 0, ay: 0, t: filteredPoint.t };
                   }
                   
-                  // Calculate acceleration if we have previous velocity - move this outside throttling
-                  let currentAccelMag = 0;
-                  // let currentJerkMag = 0; // Disabled jerk calculation for simplification
-                  
-                  if (prevVelocityRef.current && dt > 0) {
-                    const ax = (vx - prevVelocityRef.current.vx) / dt;
-                    const ay = (vy - prevVelocityRef.current.vy) / dt;
-                    currentAccelMag = Math.sqrt(ax * ax + ay * ay);
-                    
-                    // Update current acceleration state - do this even when throttling chart updates
-                    setCurrentAcceleration(currentAccelMag);
-                    
-                    // Calculate jerk if needed and we have previous acceleration
-                    if (prevAccelRef.current && dt > 0) {
-                      // Jerk calculation disabled for simplification
-                      // const jx = (ax - prevAccelRef.current.ax) / dt;
-                      // const jy = (ay - prevAccelRef.current.ay) / dt;
-                      // currentJerkMag = Math.sqrt(jx * jx + jy * jy);
-                    }
-                    
-                    // Store current acceleration for next frame
-                    prevAccelRef.current = { ax, ay, t: time };
+                  // Update velocity reference for next frame
+                  prevVelocityRef.current = { vx, vy, t: filteredPoint.t };
+                } else {
+                  // dt too small, avoid division
+                  console.warn("dt too small for velocity calculation:", dt * 1000, "ms");
+                  // Keep previous velocity
+                  setCurrentSpeed(0); // Or keep previous speed
+                }
+              } else {
+                // Initialize prevVelocityRef
+                prevVelocityRef.current = { vx: filteredPoint.x, vy: filteredPoint.y, t: filteredPoint.t };
+              }
+              
+              // STATE MACHINE LOGIC
+              console.log(`State: ${drawingPhase}, Speed: ${currentSpeedCalc.toFixed(4)}, LowThresh: ${velocityLowThreshold.toFixed(4)}, HighThresh: ${velocityHighThreshold.toFixed(4)}`);
+              
+              switch (drawingPhase) {
+                case 'IDLE':
+                  // Waiting to start a new stroke
+                  if (currentSpeedCalc > velocityHighThreshold) {
+                    console.log(`State Change: IDLE -> DRAWING (Speed ${currentSpeedCalc.toFixed(4)} > ${velocityHighThreshold.toFixed(4)})`);
+                    setDrawingPhase('DRAWING');
+                    currentSegmentRef.current = [filteredPoint]; // Start new segment
+                    potentialPauseStartTimeRef.current = null; // Clear pause timer
                   }
+                  break;
+                
+                case 'DRAWING':
+                  // Actively drawing - add point
+                  currentSegmentRef.current.push(filteredPoint);
                   
-                  // Store current velocity for next frame
-                  prevVelocityRef.current = { vx, vy, t: time };
-                  
-                  // Pause detection logic
-                  if (currentSpeed < adaptiveVelocityThreshold) {
-                    if (!isPausedRef.current) {
-                      // Starting potential pause
-                      isPausedRef.current = true;
-                      console.log("Pause Detected: isPausedRef set to true");
-                      pauseStartTimeRef.current = time;
+                  // Check for potential start of a pause
+                  if (currentSpeedCalc < velocityLowThreshold) {
+                    if (potentialPauseStartTimeRef.current === null) {
+                      // Mark potential pause start time
+                      potentialPauseStartTimeRef.current = filteredPoint.t;
+                      console.log("Potential pause start detected (Speed < Low Threshold)");
                     } else {
-                      // Continuing potential pause, check duration and stability
-                      const pauseDuration = time - (pauseStartTimeRef.current ?? time);
+                      // Check if pause duration and stability criteria met
+                      const potentialPauseDuration = filteredPoint.t - potentialPauseStartTimeRef.current;
+                      const isStable = currentAccelMagCalc < ACCELERATION_STABILITY_THRESHOLD;
                       
-                      if (pauseDuration > MIN_PAUSE_DURATION_MS) {
-                        // Check stability criteria
-                        const isStable = currentAccelMag < ACCEL_THRESHOLD_PAUSE; 
-                        // Removed jerk condition to simplify tuning based on acceleration only
+                      if (potentialPauseDuration > MIN_PAUSE_DURATION_MS && isStable) {
+                        console.log(`State Change: DRAWING -> PAUSED (Pause Confirmed: Duration ${potentialPauseDuration.toFixed(0)}ms, Stable: ${isStable})`);
+                        setDrawingPhase('PAUSED');
                         
-                        if (isStable) {
-                          // PAUSE CONFIRMED - finalize the current segment
-                          console.log(`Pause detected after ${pauseDuration.toFixed(0)}ms - segmenting at speed: ${currentSpeed.toFixed(4)}, accel: ${currentAccelMag.toFixed(4)}`);
-                          
-                          // Exclude points during the pause
-                          const pausePointCount = Math.round(MIN_PAUSE_DURATION_MS / (1000 / 30)); // Approximate based on 30fps
-                          const segmentToProcess = currentSegmentRef.current.slice(0, -pausePointCount);
-                          
-                          // Process the segment (if it has enough points)
-                          finalizeAndProcessSegment(segmentToProcess);
-                          
-                          // Clear for next segment
-                          currentSegmentRef.current = [];
-                          velocityHistoryRef.current = [];
-                          
-                          // Keep isPausedRef true until movement resumes
-                        }
+                        // Process the completed segment (pass points before the confirmed pause duration started)
+                        const pointsInPause = Math.round(MIN_PAUSE_DURATION_MS / (1000/FRAME_RATE));
+                        const segmentToSend = currentSegmentRef.current.slice(0, -pointsInPause);
+                        finalizeAndProcessSegment(segmentToSend);
                       }
                     }
                   } else {
-                    // Movement detected
-                    if (isPausedRef.current) {
-                      // Reset pause state if we were paused
-                      isPausedRef.current = false;
-                      console.log("Movement Resumed: isPausedRef set to false");
-                      pauseStartTimeRef.current = null;
-                    }
+                    // Speed is above low threshold, reset potential pause timer
+                    potentialPauseStartTimeRef.current = null;
                   }
-                }
-              } else {
-                // For the first two points when we don't have velocity yet
-                // Add them unconditionally to bootstrap the speed calculations
-                currentSegmentRef.current.push(filteredPoint);
+                  break;
+                
+                case 'PAUSED':
+                  // Do nothing here - waiting for finalizeAndProcessSegment to finish
+                  // and set the state back to IDLE
+                  console.log("State: PAUSED (Waiting for finalization)");
+                  break;
               }
             }
           }
@@ -1666,7 +1682,7 @@ const HandTracker: React.FC = () => {
                       <span className="font-medium">Segment Points:</span> {currentSegmentRef.current.length}
                     </p>
                     <p className="text-text-primary">
-                      <span className="font-medium">Paused:</span> {isPausedRef.current ? 'Yes' : 'No'}
+                      <span className="font-medium">Paused:</span> {drawingPhase === 'PAUSED' ? 'Yes' : 'No'}
                     </p>
                     <p className="text-text-primary">
                       <span className="font-medium">Recording:</span> {isSessionActive ? 'Yes' : 'No'}
