@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState, useCallback, useMemo } from 'react';
+import React, { useEffect, useRef, useState, useCallback, useMemo, useLayoutEffect } from 'react';
 import { HandLandmarker, FilesetResolver, HandLandmarkerResult, NormalizedLandmark } from '@mediapipe/tasks-vision';
 import { PlayIcon, StopIcon, ArrowPathIcon, VideoCameraIcon, VideoCameraSlashIcon } from '@heroicons/react/24/solid';
 import { Line } from 'react-chartjs-2';
@@ -880,6 +880,41 @@ const HandTracker: React.FC = () => {
   // Keep Kalman filter ref for comparison/fallback
   const kalmanFilterRef = useRef<KalmanFilter2D | null>(null);
   
+  // Loop dependencies ref to avoid stale closures
+  const loopDependenciesRef = useRef({
+    // State values
+    isSessionActive: false,
+    drawingPhase: 'IDLE' as DrawingPhase,
+    velocityHistory: [] as Array<{t: number; vx: number; vy: number; v: number}>,
+    
+    // State Setters - use empty no-param functions to avoid linter warnings
+    setCurrentPath: (() => {}) as typeof setCurrentPath,
+    setDrawingPhase: (() => {}) as typeof setDrawingPhase,
+    setCompletedSegments: (() => {}) as typeof setCompletedSegments,
+    setCurrentSpeed: (() => {}) as typeof setCurrentSpeed,
+    setCurrentAcceleration: (() => {}) as typeof setCurrentAcceleration,
+    setVelocityHistory: (() => {}) as typeof setVelocityHistory,
+    setAccelerationHistory: (() => {}) as typeof setAccelerationHistory,
+    
+    // Refs (instances)
+    positionFilters: positionFiltersRef.current,
+    velocityFilter: velocityFilterRef.current,
+    velocityHistoryBuffer: velocityHistoryRef.current,
+    pauseDetector: pauseDetectorRef.current,
+    currentStroke: [] as Array<{ x: number; y: number; z?: number; t: number }>,
+    lastPauseTime: 0,
+    lastFrameTime: 0,
+    lastChartUpdateTime: 0,
+    
+    // Constants
+    MIN_SEGMENT_LENGTH,
+    CHART_UPDATE_THROTTLE_MS,
+    MAX_KINEMATIC_HISTORY,
+    
+    // Functions
+    finalizeAndProcessSegment: (() => {}) as typeof finalizeAndProcessSegment
+  });
+  
   // --- Basic Drawing Utility ---
   const drawLandmarks = (ctx: CanvasRenderingContext2D, landmarks: NormalizedLandmark[]) => {
       if (!landmarks) return;
@@ -905,6 +940,43 @@ const HandTracker: React.FC = () => {
       });
       // Add drawing connectors if needed (e.g., using HandLandmarker.HAND_CONNECTIONS)
   };
+
+  // Update loop dependencies ref after each render to avoid stale closures
+  useLayoutEffect(() => {
+    loopDependenciesRef.current = {
+      // State values
+      isSessionActive,
+      drawingPhase,
+      velocityHistory,
+      
+      // State Setters
+      setCurrentPath,
+      setDrawingPhase,
+      setCompletedSegments,
+      setCurrentSpeed,
+      setCurrentAcceleration,
+      setVelocityHistory,
+      setAccelerationHistory,
+      
+      // Refs (instances)
+      positionFilters: positionFiltersRef.current,
+      velocityFilter: velocityFilterRef.current,
+      velocityHistoryBuffer: velocityHistoryRef.current,
+      pauseDetector: pauseDetectorRef.current,
+      currentStroke: currentStrokeRef.current,
+      lastPauseTime: lastPauseTimeRef.current,
+      lastFrameTime: lastFrameTimeRef.current,
+      lastChartUpdateTime: lastChartUpdateTimeRef.current,
+      
+      // Constants
+      MIN_SEGMENT_LENGTH,
+      CHART_UPDATE_THROTTLE_MS,
+      MAX_KINEMATIC_HISTORY,
+      
+      // Functions
+      finalizeAndProcessSegment
+    };
+  }); // No dependency array - runs after every render
 
   // Helper function to determine the next digit based on localStorage counts
   const determineNextDigit = (): number => {
@@ -1137,7 +1209,9 @@ const HandTracker: React.FC = () => {
     setPrediction,
     ws,
     submitDrawing,
-    MIN_SEGMENT_LENGTH
+    MIN_SEGMENT_LENGTH,
+    setDrawingPhase,
+    lastPauseTimeRef
   ]);
 
   // --- WebSocket Connection Management ---
@@ -1368,364 +1442,332 @@ const HandTracker: React.FC = () => {
   }, []);
 
   // --- Effect for MediaPipe Hand Detection and Drawing ---
-  const renderLoop = useCallback((time: number) => {
-    // Skip initial render
-    if (lastFrameTimeRef.current === 0) {
-      lastFrameTimeRef.current = time;
-      requestRef.current = requestAnimationFrame(renderLoop);
-      return;
-    }
-
-    // Update time reference for next frame
-    // const timeElapsedMs = time - lastFrameTimeRef.current; // Not used but kept for potential future use
-    lastFrameTimeRef.current = time;
-
-    // Detect hands and update latestResults
-    if (!handLandmarker || !videoRef.current || videoRef.current.readyState < 2) {
-      requestRef.current = requestAnimationFrame(renderLoop);
-      return;
-    }
-    
-    const video = videoRef.current;
-    const startTimeMs = performance.now();
-    const detectionResults = handLandmarker.detectForVideo(video, startTimeMs);
-    setLatestResults(detectionResults);
-
-    // Process hand landmarks if available
-    if (latestResults && latestResults.landmarks && latestResults.landmarks.length > 0) {
-      const handLandmarks = latestResults.landmarks[0]; // Get first hand's landmarks
-      if (handLandmarks && handLandmarks.length > 8) { // Ensure index finger tip (landmark 8) exists
-        // Extract index finger tip position (raw point)
-        const indexTip = handLandmarks[8];
-        const rawPoint = {
-          x: indexTip.x,
-          y: indexTip.y,
-          z: indexTip.z,
-          t: time // Current timestamp in ms
-        };
-
-        // Apply position filtering
-        const filteredPoint = {
-          x: positionFiltersRef.current[0].filter(rawPoint.x),
-          y: positionFiltersRef.current[1].filter(rawPoint.y),
-          z: positionFiltersRef.current[2].filter(rawPoint.z),
-          t: time
-        };
-
-        // Initialize Kalman filter if needed (keeping for comparison/legacy support)
-        if (!kalmanFilterRef.current) {
-          kalmanFilterRef.current = new KalmanFilter2D(filteredPoint.x, filteredPoint.y);
-        }
-
-        // Always update the visual path if session is active
-        if (isSessionActive) {
-          // Add the filtered point to the visual path for display
-          setCurrentPath(prevPath => [...prevPath, { x: filteredPoint.x, y: filteredPoint.y, z: filteredPoint.z }]);
-          
-          // If this is the first point in the current stroke, just add it
-          if (currentStrokeRef.current.length === 0) {
-            currentStrokeRef.current.push(filteredPoint);
-            // No velocity calculation for first point
-            requestRef.current = requestAnimationFrame(renderLoop);
-            return;
-          }
-          
-          // Safe velocity calculation
-          const lastPoint = currentStrokeRef.current[currentStrokeRef.current.length - 1];
-          const MIN_DT_SEC = 0.005; // Minimum time difference in seconds (5ms)
-          const dt = (filteredPoint.t - lastPoint.t) / 1000; // Convert ms to seconds
-          
-          // Handle velocity calculation
-          let rawVelocityMagnitude = 0; // Initialize with 0 instead of null
-          let vx = 0, vy = 0, vz = 0;
-          
-          if (dt >= MIN_DT_SEC) {
-            // Calculate velocity components with safety checks
-            vx = (filteredPoint.x - lastPoint.x) / dt;
-            vy = (filteredPoint.y - lastPoint.y) / dt;
-            vz = (filteredPoint.z !== undefined && lastPoint.z !== undefined) 
-              ? (filteredPoint.z - lastPoint.z) / dt 
-              : 0;
-            
-            // Check for NaN or unreasonable values
-            if (isNaN(vx) || isNaN(vy) || isNaN(vz) || 
-                !isFinite(vx) || !isFinite(vy) || !isFinite(vz)) {
-              vx = 0;
-              vy = 0;
-              vz = 0;
-              rawVelocityMagnitude = 0;
-            } else {
-              rawVelocityMagnitude = Math.sqrt(vx * vx + vy * vy + vz * vz);
-              
-              // Cap unreasonable velocities (more than 5 meters per second)
-              const MAX_REASONABLE_VELOCITY = 5000; // 5 meters per second in mm/s
-              if (rawVelocityMagnitude > MAX_REASONABLE_VELOCITY) {
-                const scale = MAX_REASONABLE_VELOCITY / rawVelocityMagnitude;
-                vx *= scale;
-                vy *= scale;
-                vz *= scale;
-                rawVelocityMagnitude = MAX_REASONABLE_VELOCITY;
-              }
-            }
-          } else {
-            // If dt is too small, use previous velocity if available
-            if (currentStrokeRef.current.length > 1) {
-              // We don't need to use prevPoint, just get previous velocity
-              const prevVelocity = velocityHistoryRef.current.getLast();
-              if (prevVelocity) {
-                vx = prevVelocity.vx;
-                vy = prevVelocity.vy;
-                vz = prevVelocity.vz;
-                rawVelocityMagnitude = prevVelocity.magnitude;
-              }
-              // If no previous velocity is available, we'll just use the zeros initialized above
-            }
-          }
-          
-          // Filter velocity
-          const filteredVelocity = velocityFilterRef.current.filter(rawVelocityMagnitude);
-            
-          // Sanity check the filtered velocity
-          const finalVelocity = Number.isFinite(filteredVelocity) ? filteredVelocity : 0;
-          
-          // Update history buffer
-          velocityHistoryRef.current.addVelocity(finalVelocity, filteredPoint.t, { vx, vy, vz, magnitude: rawVelocityMagnitude });
-          
-          // Update pause detector
-          pauseDetectorRef.current.addPoint(filteredPoint, finalVelocity);
-          
-          // Add point to current stroke
-          currentStrokeRef.current.push(filteredPoint);
-          
-          // Calculate thresholds safely
-          // const ADAPTIVE_VEL_THRESHOLD_RATIO = 0.25; // Not needed since we're not using velocityLowThreshold
-          const VELOCITY_HIGH_THRESHOLD_MULTIPLIER = 1.5;
-          const MIN_ABSOLUTE_HIGH_THRESHOLD = 0.02; // Adjusted for 0-1 scale
-          
-          const peakSpeed = velocityHistoryRef.current.getPeakVelocity();
-          // Only initialize and use velocityLowThreshold if needed in the state machine
-          // const velocityLowThreshold = velocityHistoryRef.current.getAdaptiveThreshold(ADAPTIVE_VEL_THRESHOLD_RATIO, 0.01);
-          const velocityHighThreshold = Math.max(
-            peakSpeed * VELOCITY_HIGH_THRESHOLD_MULTIPLIER, 
-            MIN_ABSOLUTE_HIGH_THRESHOLD
-          );
-          
-          // Check for pause status without creating an unused variable
-          // Only use it inside STATE MACHINE LOGIC where it's needed
-          // const isPaused = pauseDetectorRef.current.isPaused();
-          
-          // Update UI state values
-          setCurrentSpeed(finalVelocity);
-          
-          // Add to chart data with throttling
-          const now = filteredPoint.t;
-          if (now - lastChartUpdateTimeRef.current > CHART_UPDATE_THROTTLE_MS) {
-            // Add to velocity history for charts
-            setVelocityHistory(prev => {
-              const newHistory = [...prev, { t: filteredPoint.t, vx, vy, v: finalVelocity }];
-              // Trim history if it exceeds max length
-              return newHistory.length > MAX_KINEMATIC_HISTORY 
-                ? newHistory.slice(-MAX_KINEMATIC_HISTORY) 
-                : newHistory;
-            });
-            
-            // Safe acceleration calculation (optional)
-            // Only calculate acceleration if we have enough velocity history
-            if (velocityHistory.length > 1) {
-              const prevVel = velocityHistory[velocityHistory.length - 1];
-              const dtAccel = (now - prevVel.t) / 1000; // Convert to seconds
-              
-              if (dtAccel >= MIN_DT_SEC && Number.isFinite(finalVelocity) && Number.isFinite(prevVel.v)) {
-                // Calculate acceleration components safely with current velocity values
-                const ax = (vx - prevVel.vx) / dtAccel;
-                const ay = (vy - prevVel.vy) / dtAccel;
-                
-                // Calculate acceleration magnitude
-                const accelMagnitude = Math.sqrt(ax * ax + ay * ay);
-                
-                // Sanity check with reasonable upper limit
-                if (Number.isFinite(accelMagnitude) && accelMagnitude < 50) {
-                  // Update acceleration state
-                  setCurrentAcceleration(accelMagnitude);
-                  
-                  // Add to acceleration history
-                  setAccelerationHistory(prev => {
-                    const newHistory = [...prev, { t: now, ax, ay, a: accelMagnitude }];
-                    // Trim history if it exceeds max length
-                    return newHistory.length > MAX_KINEMATIC_HISTORY 
-                      ? newHistory.slice(-MAX_KINEMATIC_HISTORY) 
-                      : newHistory;
-                  });
-                } else {
-                  console.warn("Calculated unreasonable acceleration, not updating:", accelMagnitude);
-                }
-              }
-            }
-            
-            // Update the last chart update time
-            lastChartUpdateTimeRef.current = now;
-          }
-          
-          // Log state for debugging (commented out to reduce noise)
-          // console.log(`DrawingPhase: ${drawingPhase}, Speed: ${finalVelocity.toFixed(4)}, IsPaused: ${isPaused}, PeakSpeed: ${peakSpeed.toFixed(4)}`);
-          
-          // STATE MACHINE LOGIC
-          if (isSessionActive) {
-            const RESTART_COOLDOWN_MICROS = 150000; // 150ms cooldown after pause
-            
-            // Get pause status with current time in microseconds
-            const currentTimeMicros = filteredPoint.t * 1000; // Convert ms to microseconds
-            const isPaused = pauseDetectorRef.current.isPaused(currentTimeMicros);
-            
-            // Verification log for pause status
-            console.log('Tracking Loop - isPaused() returned:', isPaused);
-            
-            // Log current state for debugging (commented out to reduce noise)
-            // console.log(`Phase: ${drawingPhase}, Speed: ${finalVelocity.toFixed(4)}, HighT: ${velocityHighThreshold.toFixed(4)}, isPaused: ${isPaused}`);
-            
-            switch (drawingPhase) {
-              case 'IDLE':
-                const timeSinceLastPause = filteredPoint.t - lastPauseTimeRef.current;
-                // Check for start condition: Speed > High Threshold AND Cooldown Met
-                if (finalVelocity > velocityHighThreshold && timeSinceLastPause > RESTART_COOLDOWN_MICROS / 1000) { // Convert microseconds to milliseconds
-                  console.log(`State Change: IDLE -> DRAWING (V=${finalVelocity.toFixed(4)} > HT=${velocityHighThreshold.toFixed(4)}, Cooldown OK)`);
-                  setDrawingPhase('DRAWING');
-                  currentStrokeRef.current = [filteredPoint]; // Start new stroke buffer
-                  // Reset pause detector/history for the new stroke
-                  pauseDetectorRef.current.reset();
-                  velocityHistoryRef.current.reset();
-                }
-                break;
-                
-              case 'DRAWING':
-                // Add point to current stroke
-                currentStrokeRef.current.push(filteredPoint);
-                
-                // Check for pause condition provided by PauseDetector
-                if (isPaused) {
-                  console.log(`State Change: DRAWING -> PAUSED (Pause Detector Returned True)`);
-                  setDrawingPhase('PAUSED'); // Transition to PAUSED
-                  // Call finalizeAndProcessSegment directly without setTimeout
-                  finalizeAndProcessSegment([...currentStrokeRef.current]);
-                }
-                break;
-                
-              case 'PAUSED':
-              case 'SEGMENTING': // Treat PAUSED and SEGMENTING similarly
-                // State will be set back to IDLE by finalizeAndProcessSegment
-                // No points are added in these states
-                // console.log(`State: ${drawingPhase} (Waiting for finalization)`);
-                break;
-            }
-          } else { // Session NOT active
-            if (drawingPhase !== 'IDLE') {
-              setDrawingPhase('IDLE');
-            }
-          }
-        }
-      }
-    } else {
-      // No hand detected - if we've been recording, handle potential end of segment
-      if (isSessionActive && currentStrokeRef.current.length >= MIN_SEGMENT_LENGTH && drawingPhase === 'DRAWING') {
-        console.log('Hand lost from view - processing current segment');
-        finalizeAndProcessSegment([...currentStrokeRef.current]);
-      }
-    }
-
-    // --- Drawing Code - Keeping this mostly intact for now ---
-    const canvasCtx = canvasRef.current?.getContext("2d");
-    if (canvasCtx && canvasRef.current) {
-        // Match canvas size to video
-        if (canvasRef.current.width !== videoRef.current?.videoWidth) {
-             canvasRef.current.width = videoRef.current?.videoWidth || 640;
-        }
-        if (canvasRef.current.height !== videoRef.current?.videoHeight) {
-             canvasRef.current.height = videoRef.current?.videoHeight || 480;
-        }
-
-        canvasCtx.save();
-        canvasCtx.clearRect(0, 0, canvasRef.current.width, canvasRef.current.height);
-        
-        // Draw based on the LATEST results stored in state
-        if (latestResults && latestResults.landmarks && latestResults.landmarks.length > 0) {
-            for (const landmarks of latestResults.landmarks) {
-                drawLandmarks(canvasCtx, landmarks);
-            }
-        }
-        
-        // Draw completed segments with a lighter color
-        if (completedSegments.length > 0) {
-            canvasCtx.strokeStyle = batmanTheme.textPrimary; // Use theme color
-            canvasCtx.lineWidth = 2;
-            
-            for (const segment of completedSegments) {
-                if (segment.length > 1) {
-                    canvasCtx.beginPath();
-                    canvasCtx.moveTo(segment[0].x * canvasRef.current.width, segment[0].y * canvasRef.current.height);
-                    for (let i = 1; i < segment.length; i++) {
-                        canvasCtx.lineTo(segment[i].x * canvasRef.current.width, segment[i].y * canvasRef.current.height);
-                    }
-                    canvasCtx.stroke();
-                }
-            }
-        }
-        
-        // Draw the current segment with a brighter color
-        if (currentStrokeRef.current.length > 1) {
-            canvasCtx.strokeStyle = batmanTheme.primaryAccent; // Highlight current path
-            canvasCtx.lineWidth = 3;
-            canvasCtx.beginPath();
-            canvasCtx.moveTo(
-                currentStrokeRef.current[0].x * canvasRef.current.width, 
-                currentStrokeRef.current[0].y * canvasRef.current.height
-            );
-            for (let i = 1; i < currentStrokeRef.current.length; i++) {
-                canvasCtx.lineTo(
-                    currentStrokeRef.current[i].x * canvasRef.current.width, 
-                    currentStrokeRef.current[i].y * canvasRef.current.height
-                );
-            }
-            canvasCtx.stroke();
-        }
-        
-        canvasCtx.restore();
-    }
-    
-    // Schedule next frame
-    requestRef.current = requestAnimationFrame(renderLoop);
-  }, [
-    handLandmarker,
-    videoRef,
-    canvasRef,
-    latestResults,
-    setLatestResults,
-    isSessionActive,
-    setCurrentPath,
-    positionFiltersRef,
-    velocityFilterRef,
-    velocityHistoryRef,
-    pauseDetectorRef,
-    currentStrokeRef,
-    setCurrentSpeed,
-    setCurrentAcceleration,
-    setVelocityHistory,
-    setAccelerationHistory,
-    velocityHistory,
-    lastFrameTimeRef,
-    lastChartUpdateTimeRef,
-    drawingPhase,
-    setDrawingPhase,
-    lastPauseTimeRef,
-    finalizeAndProcessSegment,
-    completedSegments,
-    MIN_SEGMENT_LENGTH,
-    CHART_UPDATE_THROTTLE_MS,
-    MAX_KINEMATIC_HISTORY,
-    batmanTheme
-  ]);
-
   useEffect(() => {
     let animationFrameId: number | null = null;
+    
+    // Function to detect hands and update latestResults state
+    const detectHands = () => {
+      if (!handLandmarker || !videoRef.current || videoRef.current.readyState < 2) {
+        return false;
+      }
+      
+      const video = videoRef.current;
+      const startTimeMs = performance.now();
+      const detectionResults = handLandmarker.detectForVideo(video, startTimeMs);
+      setLatestResults(detectionResults);
+      return true;
+    };
+
+    const renderLoop = (time: number) => {
+      // Access latest dependencies
+      const deps = loopDependenciesRef.current;
+      
+      // Skip initial render
+      if (deps.lastFrameTime === 0) {
+        lastFrameTimeRef.current = time;
+        deps.lastFrameTime = time;
+        requestRef.current = requestAnimationFrame(renderLoop);
+        return;
+      }
+
+      // Update time reference for next frame
+      // const timeElapsedMs = time - deps.lastFrameTime; // Not used but kept for potential future use
+      lastFrameTimeRef.current = time;
+      deps.lastFrameTime = time;
+
+      // Detect hands and update latestResults
+      detectHands();
+
+      // Process hand landmarks if available
+      if (latestResults && latestResults.landmarks && latestResults.landmarks.length > 0) {
+        const handLandmarks = latestResults.landmarks[0]; // Get first hand's landmarks
+        if (handLandmarks && handLandmarks.length > 8) { // Ensure index finger tip (landmark 8) exists
+          // Extract index finger tip position (raw point)
+          const indexTip = handLandmarks[8];
+          const rawPoint = {
+            x: indexTip.x,
+            y: indexTip.y,
+            z: indexTip.z,
+            t: time // Current timestamp in ms
+          };
+
+          // Apply position filtering
+          const filteredPoint = {
+            x: deps.positionFilters[0].filter(rawPoint.x),
+            y: deps.positionFilters[1].filter(rawPoint.y),
+            z: deps.positionFilters[2].filter(rawPoint.z),
+            t: time
+          };
+
+          // Initialize Kalman filter if needed (keeping for comparison/legacy support)
+          if (!kalmanFilterRef.current) {
+            kalmanFilterRef.current = new KalmanFilter2D(filteredPoint.x, filteredPoint.y);
+          }
+
+          // Always update the visual path if session is active
+          if (deps.isSessionActive) {
+            // Add the filtered point to the visual path for display
+            deps.setCurrentPath(prevPath => [...prevPath, { x: filteredPoint.x, y: filteredPoint.y, z: filteredPoint.z }]);
+            
+            // If this is the first point in the current stroke, just add it
+            if (currentStrokeRef.current.length === 0) {
+              currentStrokeRef.current.push(filteredPoint);
+              // No velocity calculation for first point
+              return;
+            }
+            
+            // Safe velocity calculation
+            const lastPoint = currentStrokeRef.current[currentStrokeRef.current.length - 1];
+            const MIN_DT_SEC = 0.005; // Minimum time difference in seconds (5ms)
+            const dt = (filteredPoint.t - lastPoint.t) / 1000; // Convert ms to seconds
+            
+            // Handle velocity calculation
+            let rawVelocityMagnitude = 0; // Initialize with 0 instead of null
+            let vx = 0, vy = 0, vz = 0;
+            
+            if (dt >= MIN_DT_SEC) {
+              // Calculate velocity components with safety checks
+              vx = (filteredPoint.x - lastPoint.x) / dt;
+              vy = (filteredPoint.y - lastPoint.y) / dt;
+              vz = (filteredPoint.z !== undefined && lastPoint.z !== undefined) 
+                ? (filteredPoint.z - lastPoint.z) / dt 
+                : 0;
+              
+              // Check for NaN or unreasonable values
+              if (isNaN(vx) || isNaN(vy) || isNaN(vz) || 
+                  !isFinite(vx) || !isFinite(vy) || !isFinite(vz)) {
+                vx = 0;
+                vy = 0;
+                vz = 0;
+                rawVelocityMagnitude = 0;
+              } else {
+                rawVelocityMagnitude = Math.sqrt(vx * vx + vy * vy + vz * vz);
+                
+                // Cap unreasonable velocities (more than 5 meters per second)
+                const MAX_REASONABLE_VELOCITY = 5000; // 5 meters per second in mm/s
+                if (rawVelocityMagnitude > MAX_REASONABLE_VELOCITY) {
+                  const scale = MAX_REASONABLE_VELOCITY / rawVelocityMagnitude;
+                  vx *= scale;
+                  vy *= scale;
+                  vz *= scale;
+                  rawVelocityMagnitude = MAX_REASONABLE_VELOCITY;
+                }
+              }
+            } else {
+              // If dt is too small, use previous velocity if available
+              if (currentStrokeRef.current.length > 1) {
+                // We don't need to use prevPoint, just get previous velocity
+                const prevVelocity = deps.velocityHistoryBuffer.getLast();
+                if (prevVelocity) {
+                  vx = prevVelocity.vx;
+                  vy = prevVelocity.vy;
+                  vz = prevVelocity.vz;
+                  rawVelocityMagnitude = prevVelocity.magnitude;
+                }
+                // If no previous velocity is available, we'll just use the zeros initialized above
+              }
+            }
+            
+            // Filter velocity
+            const filteredVelocity = deps.velocityFilter.filter(rawVelocityMagnitude);
+              
+            // Sanity check the filtered velocity
+            const finalVelocity = Number.isFinite(filteredVelocity) ? filteredVelocity : 0;
+            
+            // Update history buffer
+            deps.velocityHistoryBuffer.addVelocity(finalVelocity, filteredPoint.t, { vx, vy, vz, magnitude: rawVelocityMagnitude });
+            
+            // Update pause detector
+            deps.pauseDetector.addPoint(filteredPoint, finalVelocity);
+            
+            // Add point to current stroke
+            currentStrokeRef.current.push(filteredPoint);
+            
+            // Calculate thresholds safely
+            // const ADAPTIVE_VEL_THRESHOLD_RATIO = 0.25; // Not needed since we're not using velocityLowThreshold
+            const VELOCITY_HIGH_THRESHOLD_MULTIPLIER = 1.5;
+            const MIN_ABSOLUTE_HIGH_THRESHOLD = 0.02; // Adjusted for 0-1 scale
+            
+            const peakSpeed = deps.velocityHistoryBuffer.getPeakVelocity();
+            // Only initialize and use velocityLowThreshold if needed in the state machine
+            // const velocityLowThreshold = velocityHistoryRef.current.getAdaptiveThreshold(ADAPTIVE_VEL_THRESHOLD_RATIO, 0.01);
+            const velocityHighThreshold = Math.max(
+              peakSpeed * VELOCITY_HIGH_THRESHOLD_MULTIPLIER, 
+              MIN_ABSOLUTE_HIGH_THRESHOLD
+            );
+            
+            // Update UI state values
+            deps.setCurrentSpeed(finalVelocity);
+            
+            // Add to chart data with throttling
+            const now = filteredPoint.t;
+            if (now - deps.lastChartUpdateTime > deps.CHART_UPDATE_THROTTLE_MS) {
+              // Add to velocity history for charts
+              deps.setVelocityHistory(prev => {
+                const newHistory = [...prev, { t: filteredPoint.t, vx, vy, v: finalVelocity }];
+                // Trim history if it exceeds max length
+                return newHistory.length > deps.MAX_KINEMATIC_HISTORY 
+                  ? newHistory.slice(-deps.MAX_KINEMATIC_HISTORY) 
+                  : newHistory;
+              });
+              
+              // Safe acceleration calculation (optional)
+              // Only calculate acceleration if we have enough velocity history
+              if (deps.velocityHistory.length > 1) {
+                const prevVel = deps.velocityHistory[deps.velocityHistory.length - 1];
+                const dtAccel = (now - prevVel.t) / 1000; // Convert to seconds
+                
+                if (dtAccel >= MIN_DT_SEC && Number.isFinite(finalVelocity) && Number.isFinite(prevVel.v)) {
+                  // Calculate acceleration components safely with current velocity values
+                  const ax = (vx - prevVel.vx) / dtAccel;
+                  const ay = (vy - prevVel.vy) / dtAccel;
+                  
+                  // Calculate acceleration magnitude
+                  const accelMagnitude = Math.sqrt(ax * ax + ay * ay);
+                  
+                  // Sanity check with reasonable upper limit
+                  if (Number.isFinite(accelMagnitude) && accelMagnitude < 50) {
+                    // Update acceleration state
+                    deps.setCurrentAcceleration(accelMagnitude);
+                    
+                    // Add to acceleration history
+                    deps.setAccelerationHistory(prev => {
+                      const newHistory = [...prev, { t: now, ax, ay, a: accelMagnitude }];
+                      // Trim history if it exceeds max length
+                      return newHistory.length > deps.MAX_KINEMATIC_HISTORY 
+                        ? newHistory.slice(-deps.MAX_KINEMATIC_HISTORY) 
+                        : newHistory;
+                    });
+                  } else {
+                    console.warn("Calculated unreasonable acceleration, not updating:", accelMagnitude);
+                  }
+                }
+              }
+              
+              // Update the last chart update time
+              lastChartUpdateTimeRef.current = now;
+              deps.lastChartUpdateTime = now;
+            }
+            
+            // STATE MACHINE LOGIC
+            if (deps.isSessionActive) {
+              const RESTART_COOLDOWN_MICROS = 150000; // 150ms cooldown after pause
+              
+              // Get pause status with current time in microseconds
+              const currentTimeMicros = filteredPoint.t * 1000; // Convert ms to microseconds
+              const isPaused = deps.pauseDetector.isPaused(currentTimeMicros);
+              
+              // Log current state for debugging
+              console.log(`Tracking Loop - isPaused() returned:`, isPaused);
+              
+              switch (deps.drawingPhase) {
+                case 'IDLE':
+                  const timeSinceLastPause = filteredPoint.t - deps.lastPauseTime;
+                  // Check for start condition: Speed > High Threshold AND Cooldown Met
+                  if (finalVelocity > velocityHighThreshold && timeSinceLastPause > RESTART_COOLDOWN_MICROS / 1000) { 
+                    console.log(`State Change: IDLE -> DRAWING (V=${finalVelocity.toFixed(4)} > HT=${velocityHighThreshold.toFixed(4)}, Cooldown OK)`);
+                    deps.setDrawingPhase('DRAWING');
+                    currentStrokeRef.current = [filteredPoint]; // Start new stroke buffer
+                    // Reset pause detector/history for the new stroke
+                    deps.pauseDetector.reset();
+                    deps.velocityHistoryBuffer.reset();
+                  }
+                  break;
+                  
+                case 'DRAWING':
+                  // Add point to current stroke
+                  currentStrokeRef.current.push(filteredPoint);
+                  
+                  // Check for pause condition provided by PauseDetector
+                  if (isPaused) {
+                    console.log(`State Change: DRAWING -> PAUSED (Pause Detector Returned True)`);
+                    deps.setDrawingPhase('PAUSED'); // Transition to PAUSED
+                    // Call finalize with the copied stroke data
+                    deps.finalizeAndProcessSegment([...currentStrokeRef.current]);
+                  }
+                  break;
+                  
+                case 'PAUSED':
+                case 'SEGMENTING': // Treat PAUSED and SEGMENTING similarly
+                  // State will be set back to IDLE by finalizeAndProcessSegment
+                  // No points are added in these states
+                  break;
+              }
+            } else if (deps.drawingPhase !== 'IDLE') {
+              deps.setDrawingPhase('IDLE');
+            }
+          }
+        }
+      } else {
+        // No hand detected - if we've been recording, handle potential end of segment
+        if (deps.isSessionActive && currentStrokeRef.current.length >= deps.MIN_SEGMENT_LENGTH && deps.drawingPhase === 'DRAWING') {
+          console.log('Hand lost from view - processing current segment');
+          deps.finalizeAndProcessSegment([...currentStrokeRef.current]);
+        }
+      }
+
+      // --- Drawing Code - Keeping this mostly intact for now ---
+      const canvasCtx = canvasRef.current?.getContext("2d");
+      if (canvasCtx && canvasRef.current) {
+          // Match canvas size to video
+          if (canvasRef.current.width !== videoRef.current?.videoWidth) {
+               canvasRef.current.width = videoRef.current?.videoWidth || 640;
+          }
+          if (canvasRef.current.height !== videoRef.current?.videoHeight) {
+               canvasRef.current.height = videoRef.current?.videoHeight || 480;
+          }
+
+          canvasCtx.save();
+          canvasCtx.clearRect(0, 0, canvasRef.current.width, canvasRef.current.height);
+          
+          // Draw based on the LATEST results stored in state
+          if (latestResults && latestResults.landmarks && latestResults.landmarks.length > 0) {
+              for (const landmarks of latestResults.landmarks) {
+                  drawLandmarks(canvasCtx, landmarks);
+              }
+          }
+          
+          // Draw completed segments with a lighter color
+          if (completedSegments.length > 0) {
+              canvasCtx.strokeStyle = batmanTheme.textPrimary; // Use theme color
+              canvasCtx.lineWidth = 2;
+              
+              for (const segment of completedSegments) {
+                  if (segment.length > 1) {
+                      canvasCtx.beginPath();
+                      canvasCtx.moveTo(segment[0].x * canvasRef.current.width, segment[0].y * canvasRef.current.height);
+                      for (let i = 1; i < segment.length; i++) {
+                          canvasCtx.lineTo(segment[i].x * canvasRef.current.width, segment[i].y * canvasRef.current.height);
+                      }
+                      canvasCtx.stroke();
+                  }
+              }
+          }
+          
+          // Draw the current segment with a brighter color
+          if (currentStrokeRef.current.length > 1) {
+              canvasCtx.strokeStyle = batmanTheme.primaryAccent; // Highlight current path
+              canvasCtx.lineWidth = 3;
+              canvasCtx.beginPath();
+              canvasCtx.moveTo(
+                  currentStrokeRef.current[0].x * canvasRef.current.width, 
+                  currentStrokeRef.current[0].y * canvasRef.current.height
+              );
+              for (let i = 1; i < currentStrokeRef.current.length; i++) {
+                  canvasCtx.lineTo(
+                      currentStrokeRef.current[i].x * canvasRef.current.width, 
+                      currentStrokeRef.current[i].y * canvasRef.current.height
+                  );
+              }
+              canvasCtx.stroke();
+          }
+          
+          canvasCtx.restore();
+      }
+      
+      // Schedule next frame
+      animationFrameId = requestAnimationFrame(renderLoop);
+    };
 
     if (webcamRunning && handLandmarker) {
         animationFrameId = requestAnimationFrame(renderLoop); // Start loop
@@ -1744,7 +1786,7 @@ const HandTracker: React.FC = () => {
         cancelAnimationFrame(animationFrameId);
       }
     };
-  }, [webcamRunning, handLandmarker, renderLoop]);
+  }, [webcamRunning, handLandmarker, latestResults, completedSegments]);
 
   // --- Enable/Disable Webcam ---
   const enableCam = async () => {

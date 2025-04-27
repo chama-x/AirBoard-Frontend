@@ -23,10 +23,10 @@
 /* These vars (e.g., var(--color-background)) are automatically created by Tailwind */
 /* from the @theme definitions above. */
 @layer base {
-  body {
+body {
     background-color: var(--color-background);
     color: var(--color-text-primary);
-    font-family: Arial, Helvetica, sans-serif;
+  font-family: Arial, Helvetica, sans-serif;
   }
   /* Add other base element styles here if needed */
   h1, h2, h3, h4, h5, h6 {
