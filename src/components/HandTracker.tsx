@@ -487,6 +487,7 @@ const HandTracker: React.FC = () => {
   const [isTrainingMode, setIsTrainingMode] = useState<boolean>(true);
   const [prediction, setPrediction] = useState<number | null>(null);
   const [showCharts, setShowCharts] = useState<boolean>(false); // Start with charts hidden
+  const [completedSegments, setCompletedSegments] = useState<Array<Array<{ x: number; y: number; z?: number; t: number }>>>([]);
   
   // Kinematic data state
   const [velocityHistory, setVelocityHistory] = useState<Array<{t: number; vx: number; vy: number; v: number}>>([]);
@@ -604,6 +605,9 @@ const HandTracker: React.FC = () => {
     }
 
     console.log(`Processing segment with ${segmentPoints.length} points.`);
+    
+    // Store a copy of the segment before normalization
+    setCompletedSegments(prev => [...prev, [...segmentPoints]]);
 
     // Normalize the segment (translate so first point is at origin)
     const firstPoint = segmentPoints[0];
@@ -613,9 +617,6 @@ const HandTracker: React.FC = () => {
       z: p.z !== undefined ? p.z - (firstPoint.z ?? 0) : undefined
     }));
 
-    // Optional: Apply additional processing like trimming or resampling
-    // (similar to the existing trimNoisyTail function but applied to the segment)
-    
     // Format the processed segment for prediction or saving
     if (isTrainingMode) {
       // In training mode, save the segment with the current digit label
@@ -964,6 +965,7 @@ const HandTracker: React.FC = () => {
     setPrediction(null); // Clear prediction display
     setPredictedDigit(null);
     setPredictionConfidence(null);
+    setCompletedSegments([]); // Clear completed segments
     
     // Reset kinematic data
     setVelocityHistory([]);
@@ -1054,8 +1056,11 @@ const HandTracker: React.FC = () => {
               // Add the filtered point to the visual path for display
               setCurrentPath(prevPath => [...prevPath, { x: filteredX, y: filteredY, z: indexTip.z }]);
               
-              // Add the filtered point to the current segment (with timestamp)
-              currentSegmentRef.current.push(filteredPoint);
+              // Only add points to the current segment if not in a confirmed pause state
+              if (!isPausedRef.current) {
+                // Add the filtered point to the current segment (with timestamp)
+                currentSegmentRef.current.push(filteredPoint);
+              }
               
               // Calculate velocity if we have at least two points
               if (currentSegmentRef.current.length >= 2) {
@@ -1214,25 +1219,46 @@ const HandTracker: React.FC = () => {
 
             canvasCtx.save();
             canvasCtx.clearRect(0, 0, canvasRef.current.width, canvasRef.current.height);
+            
             // Draw based on the LATEST results stored in state
             if (latestResults && latestResults.landmarks && latestResults.landmarks.length > 0) {
                 // console.log('Drawing landmarks for', latestResults.landmarks.length, 'hands'); // Commented out - reduces noise
                 for (const landmarks of latestResults.landmarks) {
                     drawLandmarks(canvasCtx, landmarks);
                 }
-                
-                // We've moved the path recording logic directly after Kalman filtering
-                // to ensure we use the filtered coordinates
             }
             
-            // Draw the recorded path
-            if (currentPath.length > 1) {
-                canvasCtx.strokeStyle = "#FFFFFF"; // White path
+            // Draw completed segments with a lighter color
+            if (completedSegments.length > 0) {
+                canvasCtx.strokeStyle = batmanTheme.textPrimary; // Use theme color
+                canvasCtx.lineWidth = 2;
+                
+                for (const segment of completedSegments) {
+                    if (segment.length > 1) {
+                        canvasCtx.beginPath();
+                        canvasCtx.moveTo(segment[0].x * canvasRef.current.width, segment[0].y * canvasRef.current.height);
+                        for (let i = 1; i < segment.length; i++) {
+                            canvasCtx.lineTo(segment[i].x * canvasRef.current.width, segment[i].y * canvasRef.current.height);
+                        }
+                        canvasCtx.stroke();
+                    }
+                }
+            }
+            
+            // Draw the current segment with a brighter color
+            if (currentSegmentRef.current.length > 1) {
+                canvasCtx.strokeStyle = batmanTheme.primaryAccent; // Highlight current path
                 canvasCtx.lineWidth = 3;
                 canvasCtx.beginPath();
-                canvasCtx.moveTo(currentPath[0].x * canvasRef.current.width, currentPath[0].y * canvasRef.current.height);
-                for (let i = 1; i < currentPath.length; i++) {
-                    canvasCtx.lineTo(currentPath[i].x * canvasRef.current.width, currentPath[i].y * canvasRef.current.height);
+                canvasCtx.moveTo(
+                    currentSegmentRef.current[0].x * canvasRef.current.width, 
+                    currentSegmentRef.current[0].y * canvasRef.current.height
+                );
+                for (let i = 1; i < currentSegmentRef.current.length; i++) {
+                    canvasCtx.lineTo(
+                        currentSegmentRef.current[i].x * canvasRef.current.width, 
+                        currentSegmentRef.current[i].y * canvasRef.current.height
+                    );
                 }
                 canvasCtx.stroke();
             }
