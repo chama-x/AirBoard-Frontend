@@ -552,7 +552,7 @@ class VelocityHistoryBuffer {
     this.maxSize = maxBufferSize;
     this.defaultThreshold = defaultThreshold;
     // Adjusted for MediaPipe's 0-1 coordinate scale
-    this.REASONABLE_MAX_SPEED = 2.0; 
+    this.REASONABLE_MAX_SPEED = 3.0; 
   }
 
   /**
@@ -600,7 +600,13 @@ class VelocityHistoryBuffer {
    */
   getPeakVelocity(): number {
     if (this.buffer.length === 0) return this.defaultThreshold;
-    return Math.max(...this.buffer.map(entry => entry.velocity));
+    const peak = Math.max(...this.buffer.map(entry => entry.velocity));
+    if (Number.isFinite(peak) && peak < this.REASONABLE_MAX_SPEED * 2) {
+      return peak;
+    } else {
+      // Fallback to default if peak is unreasonable
+      return this.defaultThreshold;
+    }
   }
 
   /**
@@ -652,11 +658,11 @@ class VelocityHistoryBuffer {
 class PauseDetector {
   private points: Array<{ x: number; y: number; z?: number; t: number }> = [];
   private velocities: Array<{ t: number; v: number }> = [];
-  private pauseStartTime: number | null = null;
+  private pauseStartTimeMs: number | null = null;
   private pauseConfirmed: boolean = false;
   private readonly config: {
     bufferSize: number;
-    minPauseDurationMicros: number;
+    minPauseDurationMs: number;
     velocityThreshold: number;
     positionVarianceThreshold: number;
     minPointsForVariance: number;
@@ -664,164 +670,75 @@ class PauseDetector {
   };
 
   constructor(config?: Partial<PauseDetector['config']>) {
-    // Default configuration - adjusted for MediaPipe's 0-1 coordinate scale
     this.config = {
       bufferSize: 10,
-      minPauseDurationMicros: 120000, // This is 120 milliseconds
+      minPauseDurationMs: 120, // 120ms
       velocityThreshold: 0.15,
       positionVarianceThreshold: 0.015,
-      minPointsForVariance: 5,      // Minimum points needed to calculate variance
-      varianceWindowSize: 5,        // Window size for variance calculation
+      minPointsForVariance: 5,
+      varianceWindowSize: 5,
       ...config
     };
   }
 
-  /**
-   * Add a point with velocity to the detector
-   * @param point Point coordinates with timestamp
-   * @param velocity Current velocity
-   */
   addPoint(point: { x: number; y: number; z?: number; t: number }, velocity: number): void {
-    // Add to history
     this.points.push(point);
     this.velocities.push({ t: point.t, v: velocity });
-    
-    // Limit history size
     if (this.points.length > this.config.bufferSize) {
       this.points.shift();
       this.velocities.shift();
     }
-    
-    // Check for pause using microsecond timestamp
-    const currentTimeMicros = point.t * 1000; // Convert ms to microseconds
-    this.isPaused(currentTimeMicros);
+    this.isPaused(point.t); // Pass ms
   }
 
-  /**
-   * Calculate variance of points to determine position stability
-   * @returns true if position is stable (low variance)
-   */
-  private isPositionStable(): boolean {
-    // Need enough points for meaningful variance
-    if (this.points.length < this.config.minPointsForVariance) {
-      return false;
-    }
-    
-    // Get most recent points for variance calculation
-    const recentPoints = this.points.slice(-this.config.varianceWindowSize);
-    
-    // Calculate variance in X and Y
-    const varianceX = this.calculateVariance(recentPoints.map(p => p.x));
-    const varianceY = this.calculateVariance(recentPoints.map(p => p.y));
-    
-    // Total variance (could also use max of the two)
-    const totalVariance = varianceX + varianceY;
-    
-    return totalVariance < this.config.positionVarianceThreshold;
-  }
-
-  /**
-   * Calculate variance of an array of numbers
-   * @param values Array of numeric values
-   * @returns Variance
-   */
-  private calculateVariance(values: number[]): number {
-    const n = values.length;
-    if (n < 2) return 0;
-    
-    // Calculate mean
-    const mean = values.reduce((sum, val) => sum + val, 0) / n;
-    
-    // Calculate sum of squared differences
-    const sumSquaredDiff = values.reduce((sum, val) => sum + Math.pow(val - mean, 2), 0);
-    
-    // Return variance
-    return sumSquaredDiff / n;
-  }
-
-  /**
-   * Check if a pause is currently detected
-   * @param currentTimeMicros Current time in microseconds
-   * @returns true if pause is confirmed
-   */
-  isPaused(currentTimeMicros: number = Date.now() * 1000): boolean {
-    // If we have no points or insufficient data, return current state
+  isPaused(currentTimeMs: number = Date.now()): boolean {
     if (this.points.length < this.config.minPointsForVariance) {
       return this.pauseConfirmed;
     }
-    
-    // Check velocity stability over recent points
     const recentVelocities = this.velocities.slice(-this.config.varianceWindowSize);
     const avgVelocity = recentVelocities.reduce((sum, v) => sum + v.v, 0) / recentVelocities.length;
     const isVelocityLow = avgVelocity < this.config.velocityThreshold;
-    
-    // Check position stability
     const recentPoints = this.points.slice(-this.config.varianceWindowSize);
-    
-    // Find min/max for each dimension to check range
     const xValues = recentPoints.map(p => p.x);
     const yValues = recentPoints.map(p => p.y);
     const zValues = recentPoints.filter(p => p.z !== undefined).map(p => p.z!);
-    
     const xRange = Math.max(...xValues) - Math.min(...xValues);
     const yRange = Math.max(...yValues) - Math.min(...yValues);
     const zRange = zValues.length > 0 ? Math.max(...zValues) - Math.min(...zValues) : 0;
-    
     const maxRange = Math.max(xRange, yRange, zRange);
     const isPositionStable = maxRange < this.config.positionVarianceThreshold;
-    
-    // Log current values for debugging
     console.log(
       `PauseDetector Check: AvgVel=${avgVelocity.toFixed(4)}, ` +
       `VelThr=${this.config.velocityThreshold.toFixed(4)}, IsLowVel=${isVelocityLow} | ` +
       `PosRange=${maxRange.toFixed(4)}, PosThr=${this.config.positionVarianceThreshold.toFixed(4)}, ` +
       `IsStablePos=${isPositionStable}`
     );
-    
-    // Check if conditions for pause are met
     if (isVelocityLow && isPositionStable) {
-      // Initialize pause start time if this is the first frame of a potential pause
-      if (this.pauseStartTime === null) {
-        this.pauseStartTime = currentTimeMicros / 1000; // We store in ms for compatibility with other code
-        console.log("Pause start timer set:", this.pauseStartTime);
-        return false; // Not paused long enough on the very first frame
+      if (this.pauseStartTimeMs === null) {
+        this.pauseStartTimeMs = currentTimeMs;
+        console.log("Pause start timer set:", this.pauseStartTimeMs);
+        return false;
       }
-      
-      // Calculate duration since pause started (in microseconds)
-      const elapsedMicros = currentTimeMicros - (this.pauseStartTime * 1000); // Convert stored ms to microseconds
-      console.log(`Duration Check: Elapsed=${elapsedMicros}µs, Required=${this.config.minPauseDurationMicros}µs`);
-      
-      // Check if we've paused long enough to confirm
-      const hasPausedLongEnough = elapsedMicros >= this.config.minPauseDurationMicros;
-      
-      // Update pause confirmed state based on duration
+      const elapsedMs = currentTimeMs - this.pauseStartTimeMs;
+      console.log(`Duration Check: Elapsed=${elapsedMs}ms, Required=${this.config.minPauseDurationMs}ms`);
+      const hasPausedLongEnough = elapsedMs >= this.config.minPauseDurationMs;
       this.pauseConfirmed = hasPausedLongEnough;
-      
-      // Return true ONLY if duration is met
       return hasPausedLongEnough;
     } else {
-      // Conditions not met, reset pause timer and confirmation
-      this.pauseStartTime = null;
+      this.pauseStartTimeMs = null;
       this.pauseConfirmed = false;
       return false;
     }
   }
 
-  /**
-   * Get the start time of the current pause
-   * @returns Start time of pause or null if not paused
-   */
   getPauseStartTime(): number | null {
-    return this.pauseConfirmed ? this.pauseStartTime : null;
+    return this.pauseConfirmed ? this.pauseStartTimeMs : null;
   }
 
-  /**
-   * Reset pause detection state
-   */
   reset(): void {
     this.points = [];
     this.velocities = [];
-    this.pauseStartTime = null;
+    this.pauseStartTimeMs = null;
     this.pauseConfirmed = false;
   }
 }
@@ -846,9 +763,7 @@ const HandTracker: React.FC = () => {
   
   // Kinematic data state
   const [velocityHistory, setVelocityHistory] = useState<Array<{t: number; vx: number; vy: number; v: number}>>([]);
-  const [accelerationHistory, setAccelerationHistory] = useState<Array<{t: number; ax: number; ay: number; a: number}>>([]);
   const [currentSpeed, setCurrentSpeed] = useState<number>(0);
-  const [currentAcceleration, setCurrentAcceleration] = useState<number>(0);
   
   // Video and canvas refs
   const videoRef = useRef<HTMLVideoElement>(null);
@@ -865,7 +780,7 @@ const HandTracker: React.FC = () => {
   const velocityHistoryRef = useRef(new VelocityHistoryBuffer(500, 0.05)); // 500ms window, adjusted default threshold
   const pauseDetectorRef = useRef(new PauseDetector({
     bufferSize: 10,
-    minPauseDurationMicros: 120000, // This is 120 milliseconds
+    minPauseDurationMs: 120, // 120ms
     velocityThreshold: 0.15,
     positionVarianceThreshold: 0.015
   }));
@@ -880,18 +795,16 @@ const HandTracker: React.FC = () => {
   // Loop dependencies ref to avoid stale closures
   const loopDependenciesRef = useRef({
     // State values
-    isSessionActive: false,
-    drawingPhase: 'IDLE' as DrawingPhase,
-    velocityHistory: [] as Array<{t: number; vx: number; vy: number; v: number}>,
+    isSessionActive,
+    drawingPhase,
+    velocityHistory,
     
     // State Setters - use empty no-param functions to avoid linter warnings
     setCurrentPath: (() => {}) as typeof setCurrentPath,
     setDrawingPhase: (() => {}) as typeof setDrawingPhase,
     setCompletedSegments: (() => {}) as typeof setCompletedSegments,
     setCurrentSpeed: (() => {}) as typeof setCurrentSpeed,
-    setCurrentAcceleration: (() => {}) as typeof setCurrentAcceleration,
     setVelocityHistory: (() => {}) as typeof setVelocityHistory,
-    setAccelerationHistory: (() => {}) as typeof setAccelerationHistory,
     
     // Refs (instances)
     positionFilters: positionFiltersRef.current,
@@ -951,9 +864,7 @@ const HandTracker: React.FC = () => {
       setDrawingPhase,
       setCompletedSegments,
       setCurrentSpeed,
-      setCurrentAcceleration,
       setVelocityHistory,
-      setAccelerationHistory,
       
       // Refs (instances)
       positionFilters: positionFiltersRef.current,
@@ -1206,7 +1117,6 @@ const HandTracker: React.FC = () => {
     setPrediction,
     ws,
     submitDrawing,
-    MIN_SEGMENT_LENGTH,
     setDrawingPhase,
     lastPauseTimeRef
   ]);
@@ -1372,9 +1282,7 @@ const HandTracker: React.FC = () => {
     
     // Reset kinematic data
     setVelocityHistory([]);
-    setAccelerationHistory([]);
     setCurrentSpeed(0);
-    setCurrentAcceleration(0);
     
   }, [webcamRunning, digitToDraw, isTrainingMode]);
 
@@ -1418,9 +1326,7 @@ const HandTracker: React.FC = () => {
     
     // Reset kinematic data
     setVelocityHistory([]);
-    setAccelerationHistory([]);
     setCurrentSpeed(0);
-    setCurrentAcceleration(0);
     
     // Reset Kalman filter (keeping for comparison/legacy)
     kalmanFilterRef.current = null;
@@ -1515,7 +1421,7 @@ const HandTracker: React.FC = () => {
             
             // Safe velocity calculation
             const lastPoint = currentStrokeRef.current[currentStrokeRef.current.length - 1];
-            const MIN_DT_SEC = 0.005; // Minimum time difference in seconds (5ms)
+            const MIN_DT_SEC = 0.001; // Minimum time difference in seconds (1ms)
             const dt = (filteredPoint.t - lastPoint.t) / 1000; // Convert ms to seconds
             
             // Handle velocity calculation
@@ -1541,7 +1447,7 @@ const HandTracker: React.FC = () => {
                 rawVelocityMagnitude = Math.sqrt(vx * vx + vy * vy + vz * vz);
                 
                 // Cap unreasonable velocities (more than 5 meters per second)
-                const MAX_REASONABLE_VELOCITY = 5000; // 5 meters per second in mm/s
+                const MAX_REASONABLE_VELOCITY = 3.0; // 3.0 units in normalized space
                 if (rawVelocityMagnitude > MAX_REASONABLE_VELOCITY) {
                   const scale = MAX_REASONABLE_VELOCITY / rawVelocityMagnitude;
                   vx *= scale;
@@ -1608,39 +1514,6 @@ const HandTracker: React.FC = () => {
                   : newHistory;
               });
               
-              // Safe acceleration calculation (optional)
-              // Only calculate acceleration if we have enough velocity history
-              if (deps.velocityHistory.length > 1) {
-                const prevVel = deps.velocityHistory[deps.velocityHistory.length - 1];
-                const dtAccel = (now - prevVel.t) / 1000; // Convert to seconds
-                
-                if (dtAccel >= MIN_DT_SEC && Number.isFinite(finalVelocity) && Number.isFinite(prevVel.v)) {
-                  // Calculate acceleration components safely with current velocity values
-                  const ax = (vx - prevVel.vx) / dtAccel;
-                  const ay = (vy - prevVel.vy) / dtAccel;
-                  
-                  // Calculate acceleration magnitude
-                  const accelMagnitude = Math.sqrt(ax * ax + ay * ay);
-                  
-                  // Sanity check with reasonable upper limit
-                  if (Number.isFinite(accelMagnitude) && accelMagnitude < 50) {
-                    // Update acceleration state
-                    deps.setCurrentAcceleration(accelMagnitude);
-                    
-                    // Add to acceleration history
-                    deps.setAccelerationHistory(prev => {
-                      const newHistory = [...prev, { t: now, ax, ay, a: accelMagnitude }];
-                      // Trim history if it exceeds max length
-                      return newHistory.length > deps.MAX_KINEMATIC_HISTORY 
-                        ? newHistory.slice(-deps.MAX_KINEMATIC_HISTORY) 
-                        : newHistory;
-                    });
-                  } else {
-                    console.warn("Calculated unreasonable acceleration, not updating:", accelMagnitude);
-                  }
-                }
-              }
-              
               // Update the last chart update time
               lastChartUpdateTimeRef.current = now;
               deps.lastChartUpdateTime = now;
@@ -1648,20 +1521,20 @@ const HandTracker: React.FC = () => {
             
             // STATE MACHINE LOGIC
             if (deps.isSessionActive) {
-              const RESTART_COOLDOWN_MICROS = 150000; // 150ms cooldown after pause
+              const RESTART_COOLDOWN_MS = 150; // 150ms cooldown after pause
               
               // Get pause status with current time in microseconds
-              const currentTimeMicros = filteredPoint.t * 1000; // Convert ms to microseconds
-              const isPaused = deps.pauseDetector.isPaused(currentTimeMicros);
+              const currentTimeMs = filteredPoint.t;
+              const isCurrentlyPaused = deps.pauseDetector.isPaused(currentTimeMs);
               
               // Log current state for debugging
-              console.log(`Tracking Loop - isPaused() returned:`, isPaused);
+              console.log(`Tracking Loop - isPaused() returned:`, isCurrentlyPaused);
               
               switch (deps.drawingPhase) {
                 case 'IDLE':
-                  const timeSinceLastPause = filteredPoint.t - deps.lastPauseTime;
+                  const timeSinceLastPauseMs = filteredPoint.t - deps.lastPauseTime;
                   // Check for start condition: Speed > High Threshold AND Cooldown Met
-                  if (finalVelocity > velocityHighThreshold && timeSinceLastPause > RESTART_COOLDOWN_MICROS / 1000) { 
+                  if (finalVelocity > velocityHighThreshold && timeSinceLastPauseMs > RESTART_COOLDOWN_MS) { 
                     console.log(`State Change: IDLE -> DRAWING (V=${finalVelocity.toFixed(4)} > HT=${velocityHighThreshold.toFixed(4)}, Cooldown OK)`);
                     deps.setDrawingPhase('DRAWING');
                     currentStrokeRef.current = [filteredPoint]; // Start new stroke buffer
@@ -1676,11 +1549,12 @@ const HandTracker: React.FC = () => {
                   currentStrokeRef.current.push(filteredPoint);
                   
                   // Check for pause condition provided by PauseDetector
-                  if (isPaused) {
+                  if (isCurrentlyPaused) {
                     console.log(`State Change: DRAWING -> PAUSED (Pause Detector Returned True)`);
                     deps.setDrawingPhase('PAUSED'); // Transition to PAUSED
                     // Call finalize with the copied stroke data
                     deps.finalizeAndProcessSegment([...currentStrokeRef.current]);
+                    return;
                   }
                   break;
                   
@@ -1840,18 +1714,6 @@ const HandTracker: React.FC = () => {
       },
     ],
   }), [velocityHistory]);
-
-  const accelerationChartData = useMemo(() => ({
-    datasets: [
-      {
-        label: 'Acceleration',
-        data: accelerationHistory.map(p => ({ x: p.t, y: p.a })),
-        borderColor: batmanTheme.secondaryAccent,
-        backgroundColor: `${batmanTheme.secondaryAccent}33`,
-        tension: 0.4,
-      },
-    ],
-  }), [accelerationHistory]);
 
   // Common chart options
   const chartOptions: ChartOptions<'line'> = {
@@ -2097,25 +1959,15 @@ const HandTracker: React.FC = () => {
                 <div className="h-40 w-full mb-4 bg-background p-2 rounded-lg">
                   <Line options={chartOptions} data={speedChartData} />
                 </div>
-                <div className="h-40 w-full mb-4 bg-background p-2 rounded-lg">
-                  <Line options={chartOptions} data={accelerationChartData} />
-                </div>
               </div>
               
               {/* Kinematic Data Display */}
               <div className="bg-background rounded-lg p-4 shadow-inner">
-                <div className="grid grid-cols-2 gap-4">
+                <div className="grid grid-cols-1 gap-4">
                   <div className="bg-surface p-3 rounded-md">
                     <h5 className="text-sm font-medium text-text-titles mb-1">Current Speed</h5>
                     <p className="text-xl font-bold text-primary-accent">
                       {currentSpeed ? currentSpeed.toFixed(4) : '0.0000'}
-                    </p>
-                  </div>
-                  
-                  <div className="bg-surface p-3 rounded-md">
-                    <h5 className="text-sm font-medium text-text-titles mb-1">Current Acceleration</h5>
-                    <p className="text-xl font-bold text-secondary-accent">
-                      {currentAcceleration ? currentAcceleration.toFixed(4) : '0.0000'}
                     </p>
                   </div>
                 </div>
@@ -2130,16 +1982,6 @@ const HandTracker: React.FC = () => {
                       {velocityHistory.length > 0 && (
                         <p className="text-text-primary">
                           <span className="font-medium">Max Speed:</span> {Math.max(...velocityHistory.map(v => v.v)).toFixed(4)}
-                        </p>
-                      )}
-                    </div>
-                    <div>
-                      <p className="text-text-primary">
-                        <span className="font-medium">Accel Points:</span> {accelerationHistory.length}
-                      </p>
-                      {accelerationHistory.length > 0 && (
-                        <p className="text-text-primary">
-                          <span className="font-medium">Max Accel:</span> {Math.max(...accelerationHistory.map(a => a.a)).toFixed(4)}
                         </p>
                       )}
                     </div>
