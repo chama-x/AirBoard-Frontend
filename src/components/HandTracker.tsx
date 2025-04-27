@@ -35,7 +35,6 @@ ChartJS.register(
 
 interface Point { x: number; y: number; z?: number; } // Define a Point type
 type WsStatus = 'disconnected' | 'connecting' | 'connected' | 'error';
-type DrawingPhase = 'IDLE' | 'DRAWING' | 'PAUSED' | 'SEGMENTING';
 
 // Kalman Filter Parameters - Tunable constants
 const PROCESS_NOISE_Q = 0.01; // Process noise - how much we expect the motion model to be incorrect (smaller = smoother but more laggy)
@@ -47,19 +46,12 @@ const DT = 1/30; // Time delta between frames in seconds - 30 FPS assumption
 const CHART_UPDATE_THROTTLE_MS = 200; // Increased for smoother performance
 
 // --- Segmentation Parameters (Tunable) ---
-// const MIN_PAUSE_DURATION_MS = 200; // Minimum time to consider a pause (now defined in PauseDetector config)
-// const ADAPTIVE_VEL_THRESHOLD_RATIO = 0.25; // Now handled by VelocityHistoryBuffer
-// const ADAPTIVE_VEL_WINDOW_MS = 500; // Now handled by VelocityHistoryBuffer constructor
-// const VELOCITY_HIGH_THRESHOLD_MULTIPLIER = 1.5; // Moved to renderLoop
-// const FRAME_RATE = 30; // Only used if needed for time-based calculations
 const MIN_SEGMENT_LENGTH = 10; // Minimum number of points for a segment to be processed
-// const ACCELERATION_STABILITY_THRESHOLD = 200; // Now handled by PauseDetector
 
 // Path trimming constants
 const TRIM_MIN_PATH_LENGTH = 5; // Min points needed to attempt trimming
 const TRIM_WINDOW_SIZE = 4;      // How many points to average over
 const TRIM_VARIANCE_THRESHOLD = 0.00001; // Threshold for variance detection (needs tuning)
-// const MIN_DT_MS = 1; // Now using MIN_DT_SEC in renderLoop
 
 // Local storage key for saving collected data
 const LOCAL_STORAGE_KEY = 'airboard_collected_data';
@@ -758,7 +750,6 @@ const HandTracker: React.FC = () => {
   const [isTrainingMode, setIsTrainingMode] = useState<boolean>(true);
   const [prediction, setPrediction] = useState<number | null>(null);
   const [showCharts, setShowCharts] = useState<boolean>(false);
-  const [drawingPhase, setDrawingPhase] = useState<DrawingPhase>('IDLE');
   const [completedSegments, setCompletedSegments] = useState<Array<Array<{ x: number; y: number; z?: number; t: number }>>>([]);
   
   // Kinematic data state
@@ -770,22 +761,14 @@ const HandTracker: React.FC = () => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const requestRef = useRef<number | null>(null);
   
-  // New filtering and detection refs
+  // Filtering refs
   const positionFiltersRef = useRef([
     new ExponentialSmoothingFilter(0.2), // x
     new ExponentialSmoothingFilter(0.2), // y
     new ExponentialSmoothingFilter(0.2)  // z
   ]);
   const velocityFilterRef = useRef(new ExponentialSmoothingFilter(0.3));
-  const velocityHistoryRef = useRef(new VelocityHistoryBuffer(500, 0.05)); // 500ms window, adjusted default threshold
-  const pauseDetectorRef = useRef(new PauseDetector({
-    bufferSize: 10,
-    minPauseDurationMs: 120, // 120ms
-    velocityThreshold: 0.15,
-    positionVarianceThreshold: 0.015
-  }));
   const currentStrokeRef = useRef<Array<{ x: number; y: number; z?: number; t: number }>>([]);
-  const lastPauseTimeRef = useRef<number>(0);
   const lastFrameTimeRef = useRef<number>(0);
   const lastChartUpdateTimeRef = useRef<number>(0);
   
@@ -796,12 +779,10 @@ const HandTracker: React.FC = () => {
   const loopDependenciesRef = useRef({
     // State values
     isSessionActive,
-    drawingPhase,
     velocityHistory,
     
     // State Setters - use empty no-param functions to avoid linter warnings
     setCurrentPath: (() => {}) as typeof setCurrentPath,
-    setDrawingPhase: (() => {}) as typeof setDrawingPhase,
     setCompletedSegments: (() => {}) as typeof setCompletedSegments,
     setCurrentSpeed: (() => {}) as typeof setCurrentSpeed,
     setVelocityHistory: (() => {}) as typeof setVelocityHistory,
@@ -809,10 +790,7 @@ const HandTracker: React.FC = () => {
     // Refs (instances)
     positionFilters: positionFiltersRef.current,
     velocityFilter: velocityFilterRef.current,
-    velocityHistoryBuffer: velocityHistoryRef.current,
-    pauseDetector: pauseDetectorRef.current,
     currentStroke: [] as Array<{ x: number; y: number; z?: number; t: number }>,
-    lastPauseTime: 0,
     lastFrameTime: 0,
     lastChartUpdateTime: 0,
     
@@ -856,12 +834,10 @@ const HandTracker: React.FC = () => {
     loopDependenciesRef.current = {
       // State values
       isSessionActive,
-      drawingPhase,
       velocityHistory,
       
       // State Setters
       setCurrentPath,
-      setDrawingPhase,
       setCompletedSegments,
       setCurrentSpeed,
       setVelocityHistory,
@@ -869,10 +845,7 @@ const HandTracker: React.FC = () => {
       // Refs (instances)
       positionFilters: positionFiltersRef.current,
       velocityFilter: velocityFilterRef.current,
-      velocityHistoryBuffer: velocityHistoryRef.current,
-      pauseDetector: pauseDetectorRef.current,
       currentStroke: currentStrokeRef.current,
-      lastPauseTime: lastPauseTimeRef.current,
       lastFrameTime: lastFrameTimeRef.current,
       lastChartUpdateTime: lastChartUpdateTimeRef.current,
       
@@ -1054,7 +1027,6 @@ const HandTracker: React.FC = () => {
     // Check if segment has enough points
     if (segmentPoints.length < MIN_SEGMENT_LENGTH) {
       console.log(`Segment too short (${segmentPoints.length} points), ignoring.`);
-      setDrawingPhase('IDLE');
       return;
     }
 
@@ -1100,14 +1072,7 @@ const HandTracker: React.FC = () => {
     // Clear the active stroke buffer and reset state
     currentStrokeRef.current = []; 
     
-    // Record the pause time using the last timestamp from segmentPoints if available
-    // or current time as fallback
-    const lastPointTime = segmentPoints.length > 0 ? segmentPoints[segmentPoints.length - 1].t : Date.now();
-    lastPauseTimeRef.current = lastPointTime;
-    
-    // Set the drawing phase back to IDLE
-    setDrawingPhase('IDLE');
-    console.log("Segment finalized, Phase set to IDLE.");
+    console.log("Segment finalized.");
   }, [
     isSessionActive,
     isTrainingMode,
@@ -1116,9 +1081,7 @@ const HandTracker: React.FC = () => {
     setCurrentPath,
     setPrediction,
     ws,
-    submitDrawing,
-    setDrawingPhase,
-    lastPauseTimeRef
+    submitDrawing
   ]);
 
   // --- WebSocket Connection Management ---
@@ -1261,24 +1224,18 @@ const HandTracker: React.FC = () => {
     setPredictedDigit(null);
     setPredictionConfidence(null);
     setPrediction(null); // Clear any previous prediction
-    setDrawingPhase('IDLE'); // Ensure we start in IDLE phase
     setIsSessionActive(true); // Activate the session
     console.log("handleStartSession called: isSessionActive set to true");
     
     // Reset Kalman filter for new drawing (keeping for comparison/legacy)
     kalmanFilterRef.current = null;
     
-    // Reset new filtering and detection components
+    // Reset filtering components
     positionFiltersRef.current.forEach(filter => filter.reset());
     velocityFilterRef.current.reset();
-    velocityHistoryRef.current.reset();
-    pauseDetectorRef.current.reset();
     
     // Clear current stroke
     currentStrokeRef.current = [];
-    
-    // Reset last pause time
-    lastPauseTimeRef.current = 0;
     
     // Reset kinematic data
     setVelocityHistory([]);
@@ -1292,16 +1249,10 @@ const HandTracker: React.FC = () => {
     
     // Process the final segment if it has enough points
     if (currentStrokeRef.current.length >= MIN_SEGMENT_LENGTH) {
-      // This will be implemented in the next step of the refactoring
-      // finalizeAndProcessSegment([...currentStrokeRef.current]);
-      
-      // For now, just add it to completed segments
-      if (currentStrokeRef.current.length > 0) {
-        setCompletedSegments(prev => [...prev, [...currentStrokeRef.current]]);
-      }
+      // Finalize the current stroke
+      finalizeAndProcessSegment([...currentStrokeRef.current]);
     }
     
-    setDrawingPhase('IDLE'); // Reset drawing phase
     setIsSessionActive(false);
     console.log("handleEndSession called: isSessionActive set to false");
     
@@ -1310,7 +1261,7 @@ const HandTracker: React.FC = () => {
     
     // Clear current stroke
     currentStrokeRef.current = [];
-  }, [isSessionActive]);
+  }, [isSessionActive, finalizeAndProcessSegment]);
 
   // Also update handleResetDrawing to stop the session
   const handleResetDrawing = useCallback(() => {
@@ -1320,7 +1271,6 @@ const HandTracker: React.FC = () => {
     setPredictedDigit(null);
     setPredictionConfidence(null);
     setCompletedSegments([]); // Clear completed segments
-    setDrawingPhase('IDLE'); // Reset drawing phase
     setIsSessionActive(false); // Explicitly stop the session
     console.log("handleResetDrawing called: isSessionActive set to false");
     
@@ -1331,17 +1281,13 @@ const HandTracker: React.FC = () => {
     // Reset Kalman filter (keeping for comparison/legacy)
     kalmanFilterRef.current = null;
     
-    // Reset new filtering and detection components
+    // Reset new filtering components
     positionFiltersRef.current.forEach(filter => filter.reset());
     velocityFilterRef.current.reset();
-    velocityHistoryRef.current.reset();
-    pauseDetectorRef.current.reset();
     
     // Clear current stroke
     currentStrokeRef.current = [];
     
-    // Reset last pause time
-    lastPauseTimeRef.current = 0;
   }, []);
 
   // --- Effect for MediaPipe Hand Detection and Drawing ---
@@ -1374,7 +1320,6 @@ const HandTracker: React.FC = () => {
       }
 
       // Update time reference for next frame
-      // const timeElapsedMs = time - deps.lastFrameTime; // Not used but kept for potential future use
       lastFrameTimeRef.current = time;
       deps.lastFrameTime = time;
 
@@ -1412,20 +1357,21 @@ const HandTracker: React.FC = () => {
             // Add the filtered point to the visual path for display
             deps.setCurrentPath(prevPath => [...prevPath, { x: filteredPoint.x, y: filteredPoint.y, z: filteredPoint.z }]);
             
-            // If this is the first point in the current stroke, just add it
-            if (currentStrokeRef.current.length === 0) {
-              currentStrokeRef.current.push(filteredPoint);
-              // No velocity calculation for first point
+            // Always add point to current stroke when hand is detected and session is active
+            currentStrokeRef.current.push(filteredPoint);
+            
+            // If this is the first point in the current stroke, just continue
+            if (currentStrokeRef.current.length <= 1) {
               return;
             }
             
-            // Safe velocity calculation
-            const lastPoint = currentStrokeRef.current[currentStrokeRef.current.length - 1];
+            // Safe velocity calculation (still kept for metrics display)
+            const lastPoint = currentStrokeRef.current[currentStrokeRef.current.length - 2]; // Get second-to-last point
             const MIN_DT_SEC = 0.001; // Minimum time difference in seconds (1ms)
             const dt = (filteredPoint.t - lastPoint.t) / 1000; // Convert ms to seconds
             
             // Handle velocity calculation
-            let rawVelocityMagnitude = 0; // Initialize with 0 instead of null
+            let rawVelocityMagnitude = 0; // Initialize with 0
             let vx = 0, vy = 0, vz = 0;
             
             if (dt >= MIN_DT_SEC) {
@@ -1456,19 +1402,6 @@ const HandTracker: React.FC = () => {
                   rawVelocityMagnitude = MAX_REASONABLE_VELOCITY;
                 }
               }
-            } else {
-              // If dt is too small, use previous velocity if available
-              if (currentStrokeRef.current.length > 1) {
-                // We don't need to use prevPoint, just get previous velocity
-                const prevVelocity = deps.velocityHistoryBuffer.getLast();
-                if (prevVelocity) {
-                  vx = prevVelocity.vx;
-                  vy = prevVelocity.vy;
-                  vz = prevVelocity.vz;
-                  rawVelocityMagnitude = prevVelocity.magnitude;
-                }
-                // If no previous velocity is available, we'll just use the zeros initialized above
-              }
             }
             
             // Filter velocity
@@ -1476,28 +1409,6 @@ const HandTracker: React.FC = () => {
               
             // Sanity check the filtered velocity
             const finalVelocity = Number.isFinite(filteredVelocity) ? filteredVelocity : 0;
-            
-            // Update history buffer
-            deps.velocityHistoryBuffer.addVelocity(finalVelocity, filteredPoint.t, { vx, vy, vz, magnitude: rawVelocityMagnitude });
-            
-            // Update pause detector
-            deps.pauseDetector.addPoint(filteredPoint, finalVelocity);
-            
-            // Add point to current stroke
-            currentStrokeRef.current.push(filteredPoint);
-            
-            // Calculate thresholds safely
-            // const ADAPTIVE_VEL_THRESHOLD_RATIO = 0.25; // Not needed since we're not using velocityLowThreshold
-            const VELOCITY_HIGH_THRESHOLD_MULTIPLIER = 1.5;
-            const MIN_ABSOLUTE_HIGH_THRESHOLD = 0.02; // Adjusted for 0-1 scale
-            
-            const peakSpeed = deps.velocityHistoryBuffer.getPeakVelocity();
-            // Only initialize and use velocityLowThreshold if needed in the state machine
-            // const velocityLowThreshold = velocityHistoryRef.current.getAdaptiveThreshold(ADAPTIVE_VEL_THRESHOLD_RATIO, 0.01);
-            const velocityHighThreshold = Math.max(
-              peakSpeed * VELOCITY_HIGH_THRESHOLD_MULTIPLIER, 
-              MIN_ABSOLUTE_HIGH_THRESHOLD
-            );
             
             // Update UI state values
             deps.setCurrentSpeed(finalVelocity);
@@ -1518,71 +1429,12 @@ const HandTracker: React.FC = () => {
               lastChartUpdateTimeRef.current = now;
               deps.lastChartUpdateTime = now;
             }
-            
-            // STATE MACHINE LOGIC
-            if (deps.isSessionActive) {
-              const RESTART_COOLDOWN_MS = 150; // 150ms cooldown after pause
-              
-              // Get pause status with current time in microseconds
-              const currentTimeMs = filteredPoint.t;
-              const isCurrentlyPaused = deps.pauseDetector.isPaused(currentTimeMs);
-              
-              // Log current state for debugging
-              console.log(`Tracking Loop - isPaused() returned:`, isCurrentlyPaused);
-              
-              switch (deps.drawingPhase) {
-                case 'IDLE':
-                  const timeSinceLastPauseMs = filteredPoint.t - deps.lastPauseTime;
-                  // Check for start condition: Speed > High Threshold AND Cooldown Met
-                  if (finalVelocity > velocityHighThreshold && timeSinceLastPauseMs > RESTART_COOLDOWN_MS) { 
-                    console.log(`State Change: IDLE -> DRAWING (V=${finalVelocity.toFixed(4)} > HT=${velocityHighThreshold.toFixed(4)}, Cooldown OK)`);
-                    deps.setDrawingPhase('DRAWING');
-                    currentStrokeRef.current = [filteredPoint]; // Start new stroke buffer
-                    // Reset pause detector/history for the new stroke
-                    deps.pauseDetector.reset();
-                    deps.velocityHistoryBuffer.reset();
-                  }
-                  break;
-                  
-                case 'DRAWING': { // Use block scope
-                  // 1. Check for pause condition FIRST
-                  const currentTimeMs = filteredPoint.t; // Assuming filteredPoint.t is ms
-                  const isCurrentlyPaused = deps.pauseDetector.isPaused(currentTimeMs);
-                  console.log('Tracking Loop - isPaused() returned:', isCurrentlyPaused);
-
-                  if (isCurrentlyPaused) {
-                    // If paused, finalize the segment and transition state
-                    console.log(`State Change: DRAWING -> PAUSED (Pause Detector Returned True)`);
-                    deps.setDrawingPhase('PAUSED');
-                    deps.finalizeAndProcessSegment([...currentStrokeRef.current]); // Finalize with points collected *before* this frame
-                    // currentStrokeRef is cleared inside finalizeAndProcessSegment
-                    return; // Exit the renderLoop for this frame
-                  }
-
-                  // 2. Only push point if NOT paused
-                  currentStrokeRef.current.push(filteredPoint);
-
-                  // 3. Break normally if not paused
-                  break;
-                }
-                  
-                case 'PAUSED':
-                case 'SEGMENTING': // Treat PAUSED and SEGMENTING similarly
-                  // State will be set back to IDLE by finalizeAndProcessSegment
-                  // No points are added in these states
-                  break;
-              }
-            } else if (deps.drawingPhase !== 'IDLE') {
-              deps.setDrawingPhase('IDLE');
-            }
           }
         }
-      } else {
-        // No hand detected - if we've been recording, handle potential end of segment
-        if (deps.isSessionActive && currentStrokeRef.current.length >= deps.MIN_SEGMENT_LENGTH && deps.drawingPhase === 'DRAWING') {
-          console.log('Hand lost from view - processing current segment');
-          deps.finalizeAndProcessSegment([...currentStrokeRef.current]);
-        }
+      } else if (deps.isSessionActive && currentStrokeRef.current.length >= deps.MIN_SEGMENT_LENGTH) {
+        // No hand detected - if we've been recording, handle end of continuous stroke
+        console.log('Hand lost from view - finalizing current stroke');
+        deps.finalizeAndProcessSegment([...currentStrokeRef.current]);
       }
 
       // --- Drawing Code - Keeping this mostly intact for now ---
