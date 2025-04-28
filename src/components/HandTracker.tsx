@@ -326,6 +326,8 @@ const HandTracker: React.FC = () => {
 
   // Define the segment completion handler
   const handleSegmentComplete = useCallback((segmentPoints: Array<{ x: number; y: number; z?: number; t: number }>) => {
+    // --- DIAGNOSTIC LOG ---
+    console.log(`handleSegmentComplete called. Received segment length: ${segmentPoints.length}`);
     console.log(`Segment Complete received in HandTracker with ${segmentPoints.length} points.`);
 
     // Check if segment has enough points (redundant if hook checks, but safe)
@@ -335,6 +337,8 @@ const HandTracker: React.FC = () => {
     }
 
     // Store a copy for persistent drawing
+    // --- DIAGNOSTIC LOG ---
+    console.log(`handleSegmentComplete: About to call setCompletedSegments.`);
     setCompletedSegments(prev => [...prev, [...segmentPoints]]);
 
     // Normalize the segment
@@ -710,6 +714,10 @@ const HandTracker: React.FC = () => {
       }
 
       // --- Drawing Code - Keeping this mostly intact for now ---
+      // --- DIAGNOSTIC LOG ---
+      console.log(
+          `renderLoop Frame: time=${time.toFixed(0)}, active=${deps.isSessionActive}, phase=${drawingPhase}, internalStrokeLen=${currentStrokeInternal.length}, completedSegmentsLen=${completedSegments.length}`
+      );
       const canvasCtx = canvasRef.current?.getContext("2d");
       if (canvasCtx && canvasRef.current) {
           // Match canvas size to video
@@ -736,6 +744,8 @@ const HandTracker: React.FC = () => {
               canvasCtx.lineWidth = 2;
               
               for (const segment of completedSegments) {
+                  // --- DIAGNOSTIC LOG ---
+                  console.log(`  Drawing completed segment with length: ${segment.length}`);
                   if (segment.length > 1) {
                       canvasCtx.beginPath();
                       canvasCtx.moveTo(segment[0].x * canvasRef.current.width, segment[0].y * canvasRef.current.height);
@@ -752,11 +762,19 @@ const HandTracker: React.FC = () => {
               canvasCtx.strokeStyle = batmanTheme.primaryAccent; // Highlight current path
               canvasCtx.lineWidth = 3;
               canvasCtx.beginPath();
+              // --- DIAGNOSTIC LOG ---
+              const startX = currentStrokeInternal[0].x * canvasRef.current.width;
+              const startY = currentStrokeInternal[0].y * canvasRef.current.height;
+              console.log(`  Drawing internal stroke: Start at (${startX.toFixed(1)}, ${startY.toFixed(1)})`);
               canvasCtx.moveTo(
                   currentStrokeInternal[0].x * canvasRef.current.width, 
                   currentStrokeInternal[0].y * canvasRef.current.height
               );
               for (let i = 1; i < currentStrokeInternal.length; i++) {
+                  // --- DIAGNOSTIC LOG ---
+                  const pointX = currentStrokeInternal[i].x * canvasRef.current.width;
+                  const pointY = currentStrokeInternal[i].y * canvasRef.current.height;
+                  console.log(`    lineTo (${pointX.toFixed(1)}, ${pointY.toFixed(1)})`);
                   canvasCtx.lineTo(
                       currentStrokeInternal[i].x * canvasRef.current.width, 
                       currentStrokeInternal[i].y * canvasRef.current.height

@@ -437,6 +437,8 @@ export function useSegmentation({
                 } else {
                     // Continue drawing
                     internalStrokeRef.current.push(filteredPoint);
+                    // --- DIAGNOSTIC LOG ---
+                    console.log(`useSegmentation (DRAWING): Added point. internalStrokeRef length: ${internalStrokeRef.current.length}`);
                 }
                 break;
                 
