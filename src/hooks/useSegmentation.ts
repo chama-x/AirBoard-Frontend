@@ -5,7 +5,7 @@ interface Point { x: number; y: number; z?: number; }
 interface PointWithTime extends Point { t: number; } // Timestamp in ms
 
 // State machine phases
-type DrawingPhase = 'IDLE' | 'DRAWING' | 'PAUSED';
+export type DrawingPhase = 'IDLE' | 'DRAWING' | 'PAUSED';
 
 // Configuration options for the hook and its internal detectors
 interface SegmentationConfig {
@@ -25,6 +25,8 @@ interface SegmentationConfig {
     velocityHighThresholdMultiplier: number;
     minAbsoluteHighThreshold: number;
     restartCooldownMs: number;
+    minRestartDistance: number;
+    readyAnimationDurationMs: number;
     // Other Params
     minSegmentLength: number;
     minDtSec: number; // Min time delta (in seconds) for kinematic calcs
@@ -42,6 +44,10 @@ interface UseSegmentationReturn {
     drawingPhase: DrawingPhase;
     currentStrokeInternal: PointWithTime[]; // Internal stroke being built (for potential viz)
     smoothedVelocity: number | null; // Add smoothed velocity
+    isReadyToDraw: boolean;
+    currentVelocityHighThreshold: number;
+    elapsedReadyTime: number;
+    readyAnimationDurationMs: number;
 }
 
 // Props for the hook
@@ -298,7 +304,9 @@ export function useSegmentation({
         reasonableMaxSpeed: 3.0,
         velocityHighThresholdMultiplier: 1.5, 
         minAbsoluteHighThreshold: 0.02,
-        restartCooldownMs: 150, 
+        restartCooldownMs: 150,
+        minRestartDistance: 0.05,
+        readyAnimationDurationMs: 300,
         minSegmentLength: 10, 
         minDtSec: 0.001,
         positionFilterAlpha: 0.2, 
@@ -309,6 +317,7 @@ export function useSegmentation({
     
     // State
     const [drawingPhase, setDrawingPhase] = useState<DrawingPhase>('IDLE');
+    const [isReadyToDraw, setIsReadyToDraw] = useState(false);
     
     // Refs
     const internalStrokeRef = useRef<PointWithTime[]>([]);
@@ -327,6 +336,9 @@ export function useSegmentation({
     const pauseDetectorRef = useRef(new PauseDetector(config));
     const lastPauseTimeRef = useRef<number>(0);
     const lastPointRef = useRef<PointWithTime | null>(null);
+    const lastSegmentEndPointRef = useRef<PointWithTime | null>(null);
+    const velocityHighThresholdRef = useRef<number>(config.minAbsoluteHighThreshold); // Use config value
+    const readyStartTimeRef = useRef<number | null>(null); // Add this ref
 
     // Process incoming points
     const processPoint = useCallback((rawPoint: InputPoint) => {
@@ -395,6 +407,7 @@ export function useSegmentation({
             peakVelocity * config.velocityHighThresholdMultiplier,
             config.minAbsoluteHighThreshold
         );
+        velocityHighThresholdRef.current = velocityHighThreshold; // Update the ref
         
         // Check if currently paused
         const isCurrentlyPaused = pauseDetectorRef.current.isPaused(filteredPoint.t);
@@ -402,19 +415,51 @@ export function useSegmentation({
         // State machine
         switch (drawingPhase) {
             case 'IDLE':
-                if (isSessionActive) {
-                    const timeSinceLastPause = filteredPoint.t - lastPauseTimeRef.current;
-                    
-                    if (smoothedVelocity > velocityHighThreshold && 
-                        timeSinceLastPause > config.restartCooldownMs) {
-                        console.log('Transitioning: IDLE -> DRAWING', { velocity: smoothedVelocity, threshold: velocityHighThreshold });
-                        setDrawingPhase('DRAWING');
-                        internalStrokeRef.current = [filteredPoint];
-                        pauseDetectorRef.current.reset();
-                        velocityHistoryRef.current.reset();
-                    }
+                // Calculate readiness prerequisites (distance & time cooldown)
+                let isFarEnough = !lastSegmentEndPointRef.current; // True if no previous point
+                if (lastSegmentEndPointRef.current) {
+                    const dx = filteredPoint.x - lastSegmentEndPointRef.current.x;
+                    const dy = filteredPoint.y - lastSegmentEndPointRef.current.y;
+                    const dist = Math.sqrt(dx * dx + dy * dy);
+                    isFarEnough = dist > config.minRestartDistance;
+                    // Optional log: console.log(`useSegmentation (IDLE Dist Check): ...`);
                 }
-                break;
+                const timeSinceLastPause = filteredPoint.t - lastPauseTimeRef.current;
+                const readyConditionsMet = isFarEnough && (timeSinceLastPause > config.restartCooldownMs);
+
+                // Manage entering/exiting the 'isReadyToDraw' state and timer
+                if (readyConditionsMet && !isReadyToDraw) {
+                    // Entering Ready state
+                    setIsReadyToDraw(true);
+                    readyStartTimeRef.current = filteredPoint.t; // Use point timestamp for start
+                    console.log('--- Entered READY state ---'); // Diagnostic log
+                } else if (!readyConditionsMet && isReadyToDraw) {
+                    // Exiting Ready state (e.g., moved too close again)
+                    setIsReadyToDraw(false);
+                    readyStartTimeRef.current = null;
+                    console.log('--- Exited READY state (conditions lost) ---'); // Diagnostic log
+                }
+
+                // Check conditions for transitioning to DRAWING
+                const elapsedReadyTimeInternal = isReadyToDraw && readyStartTimeRef.current ? filteredPoint.t - readyStartTimeRef.current : 0;
+
+                if (
+                    isReadyToDraw && // Must be (still) ready
+                    elapsedReadyTimeInternal >= config.readyAnimationDurationMs && // Animation time elapsed
+                    smoothedVelocity > velocityHighThreshold // Velocity threshold met
+                ) {
+                    // --- Transition to DRAWING ---
+                    console.log('Transitioning: IDLE(Ready) -> DRAWING'); // Log transition
+                    setDrawingPhase('DRAWING');
+                    setIsReadyToDraw(false); // Exit ready state
+                    readyStartTimeRef.current = null; // Reset timer
+                    internalStrokeRef.current = [filteredPoint];
+                    // Reset necessary detectors/history for a new stroke
+                    pauseDetectorRef.current.reset();
+                    velocityHistoryRef.current.reset();
+                    // DO NOT reset lastSegmentEndPointRef here
+                }
+                break; // End of IDLE case
                 
             case 'DRAWING':
                 if (!isSessionActive) {
@@ -431,9 +476,17 @@ export function useSegmentation({
                         console.log(`Discarding short segment: ${internalStrokeRef.current.length} points`);
                     }
                     
+                    // Store the last point before clearing
+                    if (internalStrokeRef.current.length > 0) {
+                        lastSegmentEndPointRef.current = internalStrokeRef.current[internalStrokeRef.current.length - 1];
+                        console.log('--- Stored last endpoint ---', lastSegmentEndPointRef.current); // Optional: Log stored point
+                    }
+
                     lastPauseTimeRef.current = filteredPoint.t;
                     internalStrokeRef.current = [];
                     setDrawingPhase('IDLE');
+                    setIsReadyToDraw(false); // Reset readiness flag
+                    readyStartTimeRef.current = null; // Reset ready timer
                 } else {
                     // Continue drawing
                     internalStrokeRef.current.push(filteredPoint);
@@ -461,8 +514,16 @@ export function useSegmentation({
         pauseDetectorRef.current.reset();
         lastPauseTimeRef.current = 0;
         lastPointRef.current = null;
+        lastSegmentEndPointRef.current = null;
+        setIsReadyToDraw(false);
+        readyStartTimeRef.current = null;
         console.log('Segmentation reset');
-    }, []);
+    }, [setIsReadyToDraw]);
+
+    // Calculate elapsed time for animation using performance.now for smoothness
+    const currentElapsedReadyTime = isReadyToDraw && readyStartTimeRef.current
+        ? performance.now() - readyStartTimeRef.current // Use performance.now()
+        : 0;
 
     // Return hook interface
     return {
@@ -470,6 +531,10 @@ export function useSegmentation({
         resetSegmentation,
         drawingPhase,
         currentStrokeInternal: internalStrokeRef.current,
-        smoothedVelocity: velocityFilterRef.current.getCurrentValue() // Return current smoothed velocity
+        smoothedVelocity: velocityFilterRef.current.getCurrentValue(),
+        isReadyToDraw,
+        currentVelocityHighThreshold: velocityHighThresholdRef.current,
+        elapsedReadyTime: currentElapsedReadyTime, // Return calculated value
+        readyAnimationDurationMs: config.readyAnimationDurationMs, // Return configured duration
     };
 } 

@@ -16,7 +16,7 @@ import {
 } from 'chart.js';
 import 'chartjs-adapter-date-fns'; // Import adapter for time scale
 import { batmanTheme } from '../config/theme';
-import { useSegmentation } from '../hooks/useSegmentation'; // Import the segmentation hook
+import { useSegmentation, DrawingPhase } from '../hooks/useSegmentation'; // Import the segmentation hook and DrawingPhase type
 
 // Register necessary Chart.js components
 ChartJS.register(
@@ -111,6 +111,11 @@ interface LoopDependencies {
   MAX_KINEMATIC_HISTORY: number;
   processPoint: (point: { x: number; y: number; z?: number; t: number }) => void;
   smoothedVelocity: number;
+  drawingPhase: DrawingPhase;
+  isReadyToDraw: boolean;
+  currentVelocityHighThreshold: number;
+  elapsedReadyTime: number;
+  readyAnimationDurationMs: number;
 }
 
 const HandTracker: React.FC = () => {
@@ -154,14 +159,23 @@ const HandTracker: React.FC = () => {
     CHART_UPDATE_THROTTLE_MS: CHART_UPDATE_THROTTLE_MS,
     MAX_KINEMATIC_HISTORY: MAX_KINEMATIC_HISTORY,
     processPoint: () => {},
-    smoothedVelocity: 0
+    smoothedVelocity: 0,
+    drawingPhase: 'IDLE',
+    isReadyToDraw: false,
+    currentVelocityHighThreshold: 0.015,
+    elapsedReadyTime: 0,
+    readyAnimationDurationMs: 300
   });
 
   // Configuration for the segmentation hook
   const segmentationConfig = {
-    minPauseDurationMs: 120,
-    velocityThreshold: 0.15,
-    positionVarianceThreshold: 0.015,
+    minPauseDurationMs: 100,      // Shorter pause detection
+    velocityThreshold: 0.12,       // Lower threshold for pause
+    positionVarianceThreshold: 0.01, // Slightly tighter variance
+    minRestartDistance: 0.15,       // Increase this value
+    velocityHighThresholdMultiplier: 0.8, // Lower multiplier for restart sensitivity
+    minAbsoluteHighThreshold: 0.015, // Lower absolute minimum speed to restart
+    restartCooldownMs: 100,        // Shorter cooldown
     // Using hook defaults for other parameters
   };
 
@@ -375,36 +389,93 @@ const HandTracker: React.FC = () => {
   }, [isTrainingMode, digitToDraw, setCompletedSegments, ws, submitDrawing, setPrediction]);
 
   // Initialize the segmentation hook
-  const { processPoint, resetSegmentation, drawingPhase, currentStrokeInternal, smoothedVelocity } = useSegmentation({
+  const { processPoint, resetSegmentation, drawingPhase, currentStrokeInternal, smoothedVelocity, isReadyToDraw, currentVelocityHighThreshold, elapsedReadyTime, readyAnimationDurationMs } = useSegmentation({
     config: segmentationConfig,
     onSegmentComplete: handleSegmentComplete,
     isSessionActive
   });
 
   // --- Basic Drawing Utility ---
-  const drawLandmarks = (ctx: CanvasRenderingContext2D, landmarks: NormalizedLandmark[]) => {
+  const drawLandmarks = (
+    ctx: CanvasRenderingContext2D,
+    landmarks: NormalizedLandmark[],
+    drawingPhase: DrawingPhase,
+    isReadyToDraw: boolean,
+    smoothedVelocity: number,
+    currentVelocityHighThreshold: number,
+    elapsedReadyTime: number,
+    readyAnimationDurationMs: number
+  ) => {
       if (!landmarks) return;
-      // Simple drawing: draw circles for landmarks (index finger tip: 8)
-      ctx.fillStyle = '#FF0000'; // Red
-      ctx.strokeStyle = '#00FF00'; // Green for connectors (optional)
+      // Default styles for landmarks
+      const defaultFillStyle = '#FF0000'; // Red for most landmarks
+      const defaultRadius = 5;
       ctx.lineWidth = 2;
+
+      // Define constants for appearance (adjust values as needed)
+      const idleRadius = 3;
+      const drawingRadius = 7;
+      const readyMinRadius = idleRadius; // Radius when circle 'touches' center
+      const readyMaxRadius = 15; // Max radius of outer circle
+      const idleColor = '#888888'; // Using fallback grey
+      const drawingColor = batmanTheme.primaryAccent || '#FFFF00'; // Using Yellow for Drawing
+      const readyOutlineColor = idleColor; // Outline color for the shrinking circle
 
       landmarks.forEach((landmark: NormalizedLandmark, index: number) => {
           const x = landmark.x * ctx.canvas.width;
           const y = landmark.y * ctx.canvas.height;
-          ctx.beginPath();
-          ctx.arc(x, y, 5, 0, 2 * Math.PI); // Draw circle
-          ctx.fill();
-          // Highlight index finger tip (landmark 8)
-          if (index === 8) {
-             ctx.fillStyle = '#0000FF'; // Blue
-             ctx.beginPath();
-             ctx.arc(x, y, 7, 0, 2 * Math.PI);
-             ctx.fill();
-             ctx.fillStyle = '#FF0000'; // Reset color
+
+          if (index === 8) { // Apply special drawing for index fingertip
+             // Get current state values directly from parameters
+            const phase = drawingPhase;
+            const isReady = isReadyToDraw;
+            const elapTime = elapsedReadyTime; // Use elapsed time from parameter
+            const animDuration = readyAnimationDurationMs; // Use duration from parameter
+
+            if (phase === 'DRAWING') {
+                // --- State: DRAWING ---
+                ctx.fillStyle = drawingColor;
+                ctx.beginPath();
+                ctx.arc(x, y, drawingRadius, 0, 2 * Math.PI);
+                ctx.fill();
+            } else {
+                // --- State: IDLE (Ready or Not Ready) ---
+                // Draw central dot
+                ctx.fillStyle = idleColor;
+                ctx.beginPath();
+                ctx.arc(x, y, idleRadius, 0, 2 * Math.PI);
+                ctx.fill();
+
+                // Calculate animation progress (0 to 1) based on time
+                // Ensure duration is not zero to avoid division by zero
+                const safeAnimDuration = animDuration > 0 ? animDuration : 300; // Use fallback if needed
+                const animProgress = isReady ? Math.min(Math.max(elapTime / safeAnimDuration, 0), 1) : 0;
+
+                // Calculate outer radius based on animation progress
+                let outerRadius = readyMaxRadius - (animProgress * (readyMaxRadius - readyMinRadius));
+                outerRadius = Math.max(outerRadius, readyMinRadius); // Clamp to min radius
+
+                // Draw the outer circle outline
+                ctx.strokeStyle = readyOutlineColor;
+                ctx.lineWidth = 1;
+                ctx.beginPath();
+                ctx.arc(x, y, outerRadius, 0, 2 * Math.PI);
+                ctx.stroke();
+
+                 // Optional Log for debugging animation:
+                 if (isReady) {
+                    console.log(`Drawing Ready Circle: elapTime=${elapTime.toFixed(0)}, animProg=${animProgress.toFixed(2)}, outerRadius=${outerRadius.toFixed(1)}`);
+                 }
+            }
+          } else {
+              // --- Logic for other landmarks ---
+              // Example: Draw other landmarks with a default style
+              ctx.fillStyle = defaultFillStyle; // Use default red
+              ctx.beginPath();
+              ctx.arc(x, y, defaultRadius, 0, 2 * Math.PI); // Use default radius
+              ctx.fill();
           }
       });
-      // Add drawing connectors if needed (e.g., using HandLandmarker.HAND_CONNECTIONS)
   };
 
   // Update loop dependencies ref after each render to avoid stale closures
@@ -412,6 +483,11 @@ const HandTracker: React.FC = () => {
     loopDependenciesRef.current = {
       // State values
       isSessionActive,
+      drawingPhase,
+      isReadyToDraw,
+      currentVelocityHighThreshold,
+      elapsedReadyTime,
+      readyAnimationDurationMs,
       
       // State Setters
       // setCurrentPath,
@@ -748,7 +824,17 @@ const HandTracker: React.FC = () => {
           // Draw based on the LATEST results stored in state
           if (latestResults && latestResults.landmarks && latestResults.landmarks.length > 0) {
               for (const landmarks of latestResults.landmarks) {
-                  drawLandmarks(canvasCtx, landmarks);
+                  // Pass all required states to drawLandmarks from dependencies ref
+                  drawLandmarks(
+                      canvasCtx,
+                      landmarks,
+                      deps.drawingPhase,
+                      deps.isReadyToDraw,
+                      deps.smoothedVelocity,
+                      deps.currentVelocityHighThreshold,
+                      deps.elapsedReadyTime, // Pass new value
+                      deps.readyAnimationDurationMs // Pass new value
+                  );
               }
           }
           
@@ -1078,7 +1164,10 @@ const HandTracker: React.FC = () => {
         
         <div className="flex flex-col space-y-4 mb-4">
           <button 
-            onClick={handleStartSession} 
+            onClick={() => {
+              console.log('--- DIAGNOSTIC LOG --- Lambda onClick triggered. Calling handleStartSession:', handleStartSession);
+              handleStartSession();
+            }}
             disabled={!webcamRunning || isSessionActive || loading || (isTrainingMode && digitToDraw === null)} 
             className="w-full px-4 py-2 bg-surface hover:bg-border text-text-primary border border-primary-accent rounded-md font-semibold transition duration-150 ease-in-out focus:outline-hidden focus:ring-3 focus:ring-offset-2 focus:ring-offset-background focus:ring-primary-accent disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-x-2"
           >
