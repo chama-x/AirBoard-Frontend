@@ -558,6 +558,7 @@ const HandTracker: React.FC = () => {
 
   // --- Drawing Controls ---
   const handleStartSession = useCallback(() => {
+    console.log('--- DIAGNOSTIC LOG --- handleStartSession entered.'); // Log entry
     if (!webcamRunning) return; // Don't start if webcam not running
     
     // In training mode, we need a digit prompt
@@ -589,6 +590,19 @@ const HandTracker: React.FC = () => {
     resetSegmentation();
     
   }, [webcamRunning, digitToDraw, isTrainingMode, resetSegmentation]);
+
+  // --- DIAGNOSTIC LOG --- Check "Start Session" button disabled conditions
+  const isDisabledLog = {
+    '!webcamRunning': !webcamRunning,
+    'isSessionActive': isSessionActive,
+    'loading': loading,
+    'isTrainingMode': isTrainingMode,
+    'digitToDraw === null': digitToDraw === null,
+    'fullExpression': !webcamRunning || isSessionActive || loading || (isTrainingMode && digitToDraw === null)
+  };
+  console.log('--- DIAGNOSTIC LOG --- Start Button Disabled Conditions:', isDisabledLog);
+  console.log('--- DIAGNOSTIC LOG --- Current digitToDraw state:', digitToDraw);
+  // --- END DIAGNOSTIC LOG ---
 
   const handleEndSession = useCallback(() => {
     if (!isSessionActive) return; 
