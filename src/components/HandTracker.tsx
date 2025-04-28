@@ -16,6 +16,7 @@ import {
 } from 'chart.js';
 import 'chartjs-adapter-date-fns'; // Import adapter for time scale
 import { batmanTheme } from '../config/theme';
+import { useSegmentation } from '../hooks/useSegmentation'; // Import the segmentation hook
 
 // Register necessary Chart.js components
 ChartJS.register(
@@ -36,22 +37,11 @@ ChartJS.register(
 interface Point { x: number; y: number; z?: number; } // Define a Point type
 type WsStatus = 'disconnected' | 'connecting' | 'connected' | 'error';
 
-// Kalman Filter Parameters - Tunable constants
-const PROCESS_NOISE_Q = 0.01; // Process noise - how much we expect the motion model to be incorrect (smaller = smoother but more laggy)
-const MEASUREMENT_NOISE_R = 0.2; // Measurement noise - how much we expect the measurements to be noisy (higher = trust measurements less)
-const INITIAL_COVARIANCE_P = 1.0; // Initial state covariance - higher means less trust in initial state
-const DT = 1/30; // Time delta between frames in seconds - 30 FPS assumption
-
 // Chart update throttling
 const CHART_UPDATE_THROTTLE_MS = 200; // Increased for smoother performance
 
 // --- Segmentation Parameters (Tunable) ---
 const MIN_SEGMENT_LENGTH = 10; // Minimum number of points for a segment to be processed
-
-// Path trimming constants
-const TRIM_MIN_PATH_LENGTH = 5; // Min points needed to attempt trimming
-const TRIM_WINDOW_SIZE = 4;      // How many points to average over
-const TRIM_VARIANCE_THRESHOLD = 0.00001; // Threshold for variance detection (needs tuning)
 
 // Local storage key for saving collected data
 const LOCAL_STORAGE_KEY = 'airboard_collected_data';
@@ -60,368 +50,6 @@ const NUM_CLASSES = 10;
 
 // Kinematic data buffer constants
 const MAX_KINEMATIC_HISTORY = 100; // Maximum number of points to keep in kinematic history
-
-/**
- * 2D Kalman Filter for smoothing finger tip trajectories
- * State vector: [x, y, vx, vy] - position and velocity in 2D
- */
-class KalmanFilter2D {
-  // State vector [x, y, vx, vy]
-  private x: number[];
-  // State covariance matrix (4x4)
-  private P: number[][];
-  // State transition matrix (4x4)
-  private A: number[][];
-  // Measurement matrix (2x4)
-  private H: number[][];
-  // Process noise covariance (4x4)
-  private Q: number[][];
-  // Measurement noise covariance (2x2)
-  private R: number[][];
-  // Identity matrix (4x4)
-  private I: number[][];
-  // Last time update was called
-  private lastTimestamp: number | null = null;
-
-  constructor(initialX = 0, initialY = 0, processNoise = PROCESS_NOISE_Q, measurementNoise = MEASUREMENT_NOISE_R) {
-    // Initialize state vector [x, y, vx, vy]
-    this.x = [initialX, initialY, 0, 0];
-
-    // Initialize state covariance with uncertainty
-    this.P = [
-      [INITIAL_COVARIANCE_P, 0, 0, 0],
-      [0, INITIAL_COVARIANCE_P, 0, 0],
-      [0, 0, INITIAL_COVARIANCE_P, 0],
-      [0, 0, 0, INITIAL_COVARIANCE_P]
-    ];
-
-    // State transition matrix for constant velocity model
-    this.A = [
-      [1, 0, DT, 0],  // x = x + vx*dt
-      [0, 1, 0, DT],  // y = y + vy*dt
-      [0, 0, 1, 0],   // vx = vx
-      [0, 0, 0, 1]    // vy = vy
-    ];
-
-    // Measurement matrix - we only measure position, not velocity
-    this.H = [
-      [1, 0, 0, 0],  // Measure x
-      [0, 1, 0, 0]   // Measure y
-    ];
-
-    // Process noise covariance - uncertainty in the motion model
-    this.Q = [
-      [processNoise, 0, 0, 0],
-      [0, processNoise, 0, 0],
-      [0, 0, processNoise * 2, 0], // Higher for velocity components
-      [0, 0, 0, processNoise * 2]
-    ];
-
-    // Measurement noise covariance - uncertainty in measurements
-    this.R = [
-      [measurementNoise, 0],
-      [0, measurementNoise]
-    ];
-
-    // Identity matrix
-    this.I = [
-      [1, 0, 0, 0],
-      [0, 1, 0, 0],
-      [0, 0, 1, 0],
-      [0, 0, 0, 1]
-    ];
-  }
-
-  /**
-   * Reset the filter with new initial position
-   */
-  reset(x: number, y: number): void {
-    this.x = [x, y, 0, 0];
-    this.P = [
-      [INITIAL_COVARIANCE_P, 0, 0, 0],
-      [0, INITIAL_COVARIANCE_P, 0, 0],
-      [0, 0, INITIAL_COVARIANCE_P, 0],
-      [0, 0, 0, INITIAL_COVARIANCE_P]
-    ];
-    this.lastTimestamp = null;
-  }
-
-  /**
-   * Update the time delta based on actual frame timing
-   */
-  private updateTimeDelta(timestamp: number): void {
-    if (this.lastTimestamp === null) {
-      // First frame, use default DT
-      this.lastTimestamp = timestamp;
-      return;
-    }
-
-    const dt = (timestamp - this.lastTimestamp) / 1000; // Convert to seconds
-    if (dt > 0 && dt < 1) { // Sanity check - not too small or large
-      // Update state transition matrix with new dt
-      this.A[0][2] = dt;
-      this.A[1][3] = dt;
-    }
-    this.lastTimestamp = timestamp;
-  }
-
-  /**
-   * Predict step - project state forward
-   */
-  predict(timestamp?: number): void {
-    // Update time delta if timestamp provided
-    if (timestamp) {
-      this.updateTimeDelta(timestamp);
-    }
-
-    // x = A * x (matrix multiplication)
-    const newX = [0, 0, 0, 0];
-    for (let i = 0; i < 4; i++) {
-      for (let j = 0; j < 4; j++) {
-        newX[i] += this.A[i][j] * this.x[j];
-      }
-    }
-    this.x = newX;
-
-    // P = A * P * A^T + Q
-    // 1. Calculate A * P
-    const AP = matrixMultiply(this.A, this.P);
-    // 2. Calculate (A * P) * A^T
-    const APAT = matrixMultiply(AP, matrixTranspose(this.A));
-    // 3. Add Q
-    this.P = matrixAdd(APAT, this.Q);
-  }
-
-  /**
-   * Update step - correct prediction with measurement
-   */
-  update(z: [number, number]): [number, number] {
-    // y = z - H * x (measurement residual)
-    const Hx = [0, 0];
-    for (let i = 0; i < 2; i++) {
-      for (let j = 0; j < 4; j++) {
-        Hx[i] += this.H[i][j] * this.x[j];
-      }
-    }
-    const y = [z[0] - Hx[0], z[1] - Hx[1]];
-
-    // S = H * P * H^T + R (residual covariance)
-    const HP = matrixMultiply(this.H, this.P);
-    const HPHt = matrixMultiply(HP, matrixTranspose(this.H));
-    const S = matrixAdd(HPHt, this.R);
-
-    // K = P * H^T * S^-1 (Kalman gain)
-    const PHt = matrixMultiply(this.P, matrixTranspose(this.H));
-    const SInv = matrixInverse2x2(S); // Specialized 2x2 inversion for efficiency
-    const K = matrixMultiply(PHt, SInv);
-
-    // x = x + K * y (update state estimate)
-    const Ky = [0, 0, 0, 0];
-    for (let i = 0; i < 4; i++) {
-      for (let j = 0; j < 2; j++) {
-        Ky[i] += K[i][j] * y[j];
-      }
-    }
-    for (let i = 0; i < 4; i++) {
-      this.x[i] += Ky[i];
-    }
-
-    // P = (I - K * H) * P (update estimate covariance)
-    const KH = matrixMultiply(K, this.H);
-    const IMinusKH = matrixSubtract(this.I, KH);
-    this.P = matrixMultiply(IMinusKH, this.P);
-
-    // Return filtered position [x, y]
-    return [this.x[0], this.x[1]];
-  }
-
-  /**
-   * Process a new measurement and return filtered position
-   */
-  process(x: number, y: number, timestamp?: number): [number, number] {
-    this.predict(timestamp);
-    return this.update([x, y]);
-  }
-
-  /**
-   * Get current state components
-   * @returns Copy of current state [x, y, vx, vy]
-   */
-  getState(): number[] {
-    // Use spread operator to create a copy of the state vector
-    return [this.x[0], this.x[1], this.x[2], this.x[3]];
-  }
-  
-  /**
-   * Get the current velocity components
-   * @returns [vx, vy] - Velocity components
-   */
-  getVelocity(): [number, number] {
-    const state = this.getState();
-    return [state[2], state[3]];
-  }
-  
-  /**
-   * Get the current speed (magnitude of velocity)
-   * @returns speed
-   */
-  getSpeed(): number {
-    const [vx, vy] = this.getVelocity();
-    return Math.sqrt(vx * vx + vy * vy);
-  }
-}
-
-// Matrix operations helpers
-function matrixMultiply(a: number[][], b: number[][]): number[][] {
-  const aRows = a.length;
-  const aCols = a[0].length;
-  const bCols = b[0].length;
-  const result: number[][] = Array(aRows).fill(0).map(() => Array(bCols).fill(0));
-
-  for (let i = 0; i < aRows; i++) {
-    for (let j = 0; j < bCols; j++) {
-      for (let k = 0; k < aCols; k++) {
-        result[i][j] += a[i][k] * b[k][j];
-      }
-    }
-  }
-  return result;
-}
-
-function matrixTranspose(m: number[][]): number[][] {
-  const rows = m.length;
-  const cols = m[0].length;
-  const result: number[][] = Array(cols).fill(0).map(() => Array(rows).fill(0));
-
-  for (let i = 0; i < rows; i++) {
-    for (let j = 0; j < cols; j++) {
-      result[j][i] = m[i][j];
-    }
-  }
-  return result;
-}
-
-function matrixAdd(a: number[][], b: number[][]): number[][] {
-  const rows = a.length;
-  const cols = a[0].length;
-  const result: number[][] = Array(rows).fill(0).map(() => Array(cols).fill(0));
-
-  for (let i = 0; i < rows; i++) {
-    for (let j = 0; j < cols; j++) {
-      result[i][j] = a[i][j] + b[i][j];
-    }
-  }
-  return result;
-}
-
-function matrixSubtract(a: number[][], b: number[][]): number[][] {
-  const rows = a.length;
-  const cols = a[0].length;
-  const result: number[][] = Array(rows).fill(0).map(() => Array(cols).fill(0));
-
-  for (let i = 0; i < rows; i++) {
-    for (let j = 0; j < cols; j++) {
-      result[i][j] = a[i][j] - b[i][j];
-    }
-  }
-  return result;
-}
-
-// Special case for inverting a 2x2 matrix (used in Kalman filter)
-function matrixInverse2x2(m: number[][]): number[][] {
-  const det = m[0][0] * m[1][1] - m[0][1] * m[1][0];
-  if (Math.abs(det) < 1e-10) {
-    // Avoid division by zero or very small values
-    return [[1, 0], [0, 1]]; // Return identity as fallback
-  }
-
-  const invDet = 1 / det;
-  return [
-    [m[1][1] * invDet, -m[0][1] * invDet],
-    [-m[1][0] * invDet, m[0][0] * invDet]
-  ];
-}
-
-/**
- * Trim noisy tail segments from the drawing path based on positional variance
- * @param path The recorded path of points
- * @returns Trimmed path with noisy tail removed
- * @deprecated No longer used with the session-based model
- */
-// eslint-disable-next-line @typescript-eslint/no-unused-vars
-const trimNoisyTail = (path: Point[]): Point[] => {
-  // If path is too short, return as is
-  if (path.length < TRIM_MIN_PATH_LENGTH) {
-    console.log("Path too short for trimming:", path.length);
-    return path;
-  }
-
-  // Helper function to calculate variance for a set of points along a dimension
-  const calculateVariance = (points: Point[], dimension: 'x' | 'y'): number => {
-    if (points.length < 2) return 0;
-    
-    // Extract the specified dimension values
-    const values = points.map(p => p[dimension]);
-    
-    // Calculate mean
-    const mean = values.reduce((sum, val) => sum + val, 0) / values.length;
-    
-    // Calculate variance (average of squared differences from mean)
-    const squaredDifferences = values.map(val => Math.pow(val - mean, 2));
-    const variance = squaredDifferences.reduce((sum, val) => sum + val, 0) / values.length;
-    
-    return variance;
-  };
-
-  // Find the point where variance transitions from low (jittery tail) to high (intentional stroke)
-  let cutoffIndex = -1;
-  
-  console.log("Starting variance-based tail trimming analysis...");
-  
-  // Iterate backward from the end to find where variance increases
-  for (let i = path.length - 1; i >= TRIM_WINDOW_SIZE; i--) {
-    // Get current window of points
-    const currentWindow = path.slice(i - TRIM_WINDOW_SIZE + 1, i + 1);
-    
-    // Calculate variance in both dimensions
-    const varianceX = calculateVariance(currentWindow, 'x');
-    const varianceY = calculateVariance(currentWindow, 'y');
-    
-    // Combined variance measure
-    const totalVariance = varianceX + varianceY;
-    
-    // Log every few iterations to avoid flooding console
-    if ((path.length - i) % 5 === 0) {
-      console.log(`Window at index ${i}: varianceX=${varianceX.toExponential(4)}, varianceY=${varianceY.toExponential(4)}, total=${totalVariance.toExponential(4)}`);
-    }
-    
-    // When we find a window with variance above threshold, we've found the transition point
-    // This means we're moving from the jittery tail (low variance) to the main stroke (higher variance)
-    if (totalVariance >= TRIM_VARIANCE_THRESHOLD) {
-      cutoffIndex = i;
-      console.log(`Transition point found at index ${i}: totalVariance=${totalVariance.toExponential(4)}, threshold=${TRIM_VARIANCE_THRESHOLD.toExponential(4)}`);
-      break;
-    }
-  }
-
-  // Return the trimmed path if a cutoff was found, otherwise return the original
-  if (cutoffIndex > 0) {
-    // Keep up to the cutoff index (inclusive)
-    console.log(`Trimming path from ${path.length} to ${cutoffIndex + 1} points`);
-    return path.slice(0, cutoffIndex + 1);
-  }
-  
-  // Fallback: if all windows had low variance, return a minimal subset of the path
-  // This can happen if the entire end of the path is just random jitter
-  if (path.length > TRIM_MIN_PATH_LENGTH * 2) {
-    const fallbackLength = Math.max(path.length - TRIM_WINDOW_SIZE, TRIM_MIN_PATH_LENGTH);
-    console.log(`No clear variance transition found - returning first ${fallbackLength} points`);
-    return path.slice(0, fallbackLength);
-  }
-  
-  console.log("No variance transition found and path is short - returning full path");
-  return path;
-};
 
 /**
  * Legacy moving average smoothing - kept for reference or fallback
@@ -469,270 +97,20 @@ const smoothPath = (path: Point[], windowSize: number = 3): Point[] => {
   return smoothedPath;
 };
 
-// Helper Classes for Filtering and Detection
-
-/**
- * ExponentialSmoothingFilter - Simple exponential smoothing filter for 1D values
- * Uses the formula: y_t = alpha * x_t + (1 - alpha) * y_{t-1}
- * where alpha is the smoothing factor (0-1)
- */
-class ExponentialSmoothingFilter {
-  private alpha: number;
-  private lastFilteredValue: number | null = null;
-
-  /**
-   * Create a new filter with the specified smoothing factor
-   * @param alpha Smoothing factor (0-1). Lower values = more smoothing but more lag.
-   */
-  constructor(alpha: number = 0.2) {
-    // Clamp alpha to valid range
-    this.alpha = Math.max(0.01, Math.min(1, alpha));
-  }
-
-  /**
-   * Filter a value using exponential smoothing
-   * @param value The raw value to filter
-   * @returns The filtered value
-   */
-  filter(value: number): number {
-    // If this is the first value, initialize and return
-    if (this.lastFilteredValue === null) {
-      this.lastFilteredValue = value;
-      return value;
-    }
-
-    // Apply exponential smoothing formula
-    const filteredValue = this.alpha * value + (1 - this.alpha) * this.lastFilteredValue;
-    this.lastFilteredValue = filteredValue;
-    return filteredValue;
-  }
-
-  /**
-   * Reset the filter
-   */
-  reset(): void {
-    this.lastFilteredValue = null;
-  }
-
-  /**
-   * Get the last filtered value
-   * @returns The last filtered value or null if filter has not been used
-   */
-  getLastValue(): number | null {
-    return this.lastFilteredValue;
-  }
-}
-
-/**
- * VelocityHistoryBuffer - Stores recent velocity values and provides adaptive thresholding
- */
-class VelocityHistoryBuffer {
-  private buffer: Array<{ timestamp: number; velocity: number; vx?: number; vy?: number; vz?: number; magnitude?: number }> = [];
-  private readonly maxSize: number;
-  private readonly windowSizeMs: number;
-  public readonly defaultThreshold: number;
-  private readonly REASONABLE_MAX_SPEED: number;
-
-  /**
-   * Create a new velocity history buffer
-   * @param windowSizeMs Time window in ms for velocity history
-   * @param defaultThreshold Default threshold to use when buffer is empty
-   * @param maxBufferSize Maximum number of velocity samples to store
-   */
-  constructor(windowSizeMs: number = 500, defaultThreshold: number = 0.05, maxBufferSize: number = 100) {
-    this.windowSizeMs = windowSizeMs;
-    this.maxSize = maxBufferSize;
-    this.defaultThreshold = defaultThreshold;
-    // Adjusted for MediaPipe's 0-1 coordinate scale
-    this.REASONABLE_MAX_SPEED = 3.0; 
-  }
-
-  /**
-   * Add a velocity value to the buffer
-   * @param velocity The velocity value to add
-   * @param timestamp Optional timestamp (defaults to current time)
-   * @param components Optional velocity vector components
-   */
-  addVelocity(
-    velocity: number, 
-    timestamp: number = Date.now(), 
-    components?: { vx: number; vy: number; vz: number; magnitude: number }
-  ): void {
-    // Sanity check - ignore unreasonably high values
-    if (!Number.isFinite(velocity) || velocity > this.REASONABLE_MAX_SPEED) {
-      console.warn(`Ignoring unreasonable velocity: ${velocity}`);
-      return;
-    }
-
-    // Add to buffer with optional vector components
-    const entry = { timestamp, velocity, ...components };
-    this.buffer.push(entry);
-    
-    // Prune old entries
-    this.pruneOldEntries(timestamp);
-    
-    // Trim buffer if it exceeds max size
-    if (this.buffer.length > this.maxSize) {
-      this.buffer = this.buffer.slice(-this.maxSize);
-    }
-  }
-
-  /**
-   * Remove entries older than the window size
-   * @param currentTime Current timestamp to compare against
-   */
-  pruneOldEntries(currentTime: number): void {
-    const cutoffTime = currentTime - this.windowSizeMs;
-    this.buffer = this.buffer.filter(entry => entry.timestamp >= cutoffTime);
-  }
-
-  /**
-   * Get the peak velocity in the buffer
-   * @returns The maximum velocity value, or defaultThreshold if buffer is empty
-   */
-  getPeakVelocity(): number {
-    if (this.buffer.length === 0) return this.defaultThreshold;
-    const peak = Math.max(...this.buffer.map(entry => entry.velocity));
-    if (Number.isFinite(peak) && peak < this.REASONABLE_MAX_SPEED * 2) {
-      return peak;
-    } else {
-      // Fallback to default if peak is unreasonable
-      return this.defaultThreshold;
-    }
-  }
-
-  /**
-   * Calculate an adaptive velocity threshold based on recent history
-   * @param ratio Ratio of peak velocity to use as threshold (0-1)
-   * @param minimumThreshold Minimum threshold value to return
-   * @returns Adaptive threshold
-   */
-  getAdaptiveThreshold(ratio: number = 0.25, minimumThreshold: number = 0.01): number {
-    const peak = this.getPeakVelocity();
-    return Math.max(peak * ratio, minimumThreshold);
-  }
-
-  /**
-   * Reset the buffer
-   */
-  reset(): void {
-    this.buffer = [];
-  }
-
-  /**
-   * Get the number of entries in the buffer
-   */
-  size(): number {
-    return this.buffer.length;
-  }
-
-  /**
-   * Get the last velocity entry in the buffer
-   * @returns The last velocity entry or null if buffer is empty
-   */
-  getLast(): { vx: number; vy: number; vz: number; magnitude: number } | null {
-    if (this.buffer.length === 0) return null;
-    const lastEntry = this.buffer[this.buffer.length - 1];
-    if (!lastEntry.vx || !lastEntry.vy || !lastEntry.vz || !lastEntry.magnitude) return null;
-    
-    return {
-      vx: lastEntry.vx,
-      vy: lastEntry.vy,
-      vz: lastEntry.vz,
-      magnitude: lastEntry.magnitude
-    };
-  }
-}
-
-/**
- * Pause detection using velocity-based and position variance criteria
- */
-class PauseDetector {
-  private points: Array<{ x: number; y: number; z?: number; t: number }> = [];
-  private velocities: Array<{ t: number; v: number }> = [];
-  private pauseStartTimeMs: number | null = null;
-  private pauseConfirmed: boolean = false;
-  private readonly config: {
-    bufferSize: number;
-    minPauseDurationMs: number;
-    velocityThreshold: number;
-    positionVarianceThreshold: number;
-    minPointsForVariance: number;
-    varianceWindowSize: number;
-  };
-
-  constructor(config?: Partial<PauseDetector['config']>) {
-    this.config = {
-      bufferSize: 10,
-      minPauseDurationMs: 120, // 120ms
-      velocityThreshold: 0.15,
-      positionVarianceThreshold: 0.015,
-      minPointsForVariance: 5,
-      varianceWindowSize: 5,
-      ...config
-    };
-  }
-
-  addPoint(point: { x: number; y: number; z?: number; t: number }, velocity: number): void {
-    this.points.push(point);
-    this.velocities.push({ t: point.t, v: velocity });
-    if (this.points.length > this.config.bufferSize) {
-      this.points.shift();
-      this.velocities.shift();
-    }
-    this.isPaused(point.t); // Pass ms
-  }
-
-  isPaused(currentTimeMs: number = Date.now()): boolean {
-    if (this.points.length < this.config.minPointsForVariance) {
-      return this.pauseConfirmed;
-    }
-    const recentVelocities = this.velocities.slice(-this.config.varianceWindowSize);
-    const avgVelocity = recentVelocities.reduce((sum, v) => sum + v.v, 0) / recentVelocities.length;
-    const isVelocityLow = avgVelocity < this.config.velocityThreshold;
-    const recentPoints = this.points.slice(-this.config.varianceWindowSize);
-    const xValues = recentPoints.map(p => p.x);
-    const yValues = recentPoints.map(p => p.y);
-    const zValues = recentPoints.filter(p => p.z !== undefined).map(p => p.z!);
-    const xRange = Math.max(...xValues) - Math.min(...xValues);
-    const yRange = Math.max(...yValues) - Math.min(...yValues);
-    const zRange = zValues.length > 0 ? Math.max(...zValues) - Math.min(...zValues) : 0;
-    const maxRange = Math.max(xRange, yRange, zRange);
-    const isPositionStable = maxRange < this.config.positionVarianceThreshold;
-    console.log(
-      `PauseDetector Check: AvgVel=${avgVelocity.toFixed(4)}, ` +
-      `VelThr=${this.config.velocityThreshold.toFixed(4)}, IsLowVel=${isVelocityLow} | ` +
-      `PosRange=${maxRange.toFixed(4)}, PosThr=${this.config.positionVarianceThreshold.toFixed(4)}, ` +
-      `IsStablePos=${isPositionStable}`
-    );
-    if (isVelocityLow && isPositionStable) {
-      if (this.pauseStartTimeMs === null) {
-        this.pauseStartTimeMs = currentTimeMs;
-        console.log("Pause start timer set:", this.pauseStartTimeMs);
-        return false;
-      }
-      const elapsedMs = currentTimeMs - this.pauseStartTimeMs;
-      console.log(`Duration Check: Elapsed=${elapsedMs}ms, Required=${this.config.minPauseDurationMs}ms`);
-      const hasPausedLongEnough = elapsedMs >= this.config.minPauseDurationMs;
-      this.pauseConfirmed = hasPausedLongEnough;
-      return hasPausedLongEnough;
-    } else {
-      this.pauseStartTimeMs = null;
-      this.pauseConfirmed = false;
-      return false;
-    }
-  }
-
-  getPauseStartTime(): number | null {
-    return this.pauseConfirmed ? this.pauseStartTimeMs : null;
-  }
-
-  reset(): void {
-    this.points = [];
-    this.velocities = [];
-    this.pauseStartTimeMs = null;
-    this.pauseConfirmed = false;
-  }
+// After the type definitions near the top of the file
+interface LoopDependencies {
+  isSessionActive: boolean;
+  // setCurrentPath: React.Dispatch<React.SetStateAction<Point[]>>;
+  setCompletedSegments: React.Dispatch<React.SetStateAction<Array<Array<{ x: number; y: number; z?: number; t: number }>>>>;
+  setVelocityHistory: React.Dispatch<React.SetStateAction<Array<{t: number; v: number}>>>;
+  currentStroke: Array<{ x: number; y: number; z?: number; t: number }>;
+  lastFrameTime: number;
+  lastChartUpdateTime: number;
+  MIN_SEGMENT_LENGTH: number;
+  CHART_UPDATE_THROTTLE_MS: number;
+  MAX_KINEMATIC_HISTORY: number;
+  processPoint: (point: { x: number; y: number; z?: number; t: number }) => void;
+  smoothedVelocity: number;
 }
 
 const HandTracker: React.FC = () => {
@@ -741,7 +119,6 @@ const HandTracker: React.FC = () => {
   const [loading, setLoading] = useState<boolean>(true);
   const [latestResults, setLatestResults] = useState<HandLandmarkerResult | null>(null);
   const [isSessionActive, setIsSessionActive] = useState<boolean>(false);
-  const [currentPath, setCurrentPath] = useState<Point[]>([]);
   const [digitToDraw, setDigitToDraw] = useState<number | null>(null);
   const [ws, setWs] = useState<WebSocket | null>(null);
   const [wsStatus, setWsStatus] = useState<WsStatus>('disconnected');
@@ -753,111 +130,40 @@ const HandTracker: React.FC = () => {
   const [completedSegments, setCompletedSegments] = useState<Array<Array<{ x: number; y: number; z?: number; t: number }>>>([]);
   
   // Kinematic data state
-  const [velocityHistory, setVelocityHistory] = useState<Array<{t: number; vx: number; vy: number; v: number}>>([]);
-  const [currentSpeed, setCurrentSpeed] = useState<number>(0);
+  const [velocityHistory, setVelocityHistory] = useState<Array<{t: number; v: number}>>([]);
   
   // Video and canvas refs
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const requestRef = useRef<number | null>(null);
   
-  // Filtering refs
-  const positionFiltersRef = useRef([
-    new ExponentialSmoothingFilter(0.2), // x
-    new ExponentialSmoothingFilter(0.2), // y
-    new ExponentialSmoothingFilter(0.2)  // z
-  ]);
-  const velocityFilterRef = useRef(new ExponentialSmoothingFilter(0.3));
+  // Keep Kalman filter for now (legacy support) - REMOVE
+  // const kalmanFilterRef = useRef<KalmanFilter2D | null>(null);
   const currentStrokeRef = useRef<Array<{ x: number; y: number; z?: number; t: number }>>([]);
   const lastFrameTimeRef = useRef<number>(0);
   const lastChartUpdateTimeRef = useRef<number>(0);
-  
-  // Keep Kalman filter ref for comparison/fallback
-  const kalmanFilterRef = useRef<KalmanFilter2D | null>(null);
-  
-  // Loop dependencies ref to avoid stale closures
-  const loopDependenciesRef = useRef({
-    // State values
-    isSessionActive,
-    velocityHistory,
-    
-    // State Setters - use empty no-param functions to avoid linter warnings
-    setCurrentPath: (() => {}) as typeof setCurrentPath,
-    setCompletedSegments: (() => {}) as typeof setCompletedSegments,
-    setCurrentSpeed: (() => {}) as typeof setCurrentSpeed,
-    setVelocityHistory: (() => {}) as typeof setVelocityHistory,
-    
-    // Refs (instances)
-    positionFilters: positionFiltersRef.current,
-    velocityFilter: velocityFilterRef.current,
-    currentStroke: [] as Array<{ x: number; y: number; z?: number; t: number }>,
+  const loopDependenciesRef = useRef<LoopDependencies>({
+    isSessionActive: false,
+    // setCurrentPath: () => {},
+    setCompletedSegments: () => {},
+    setVelocityHistory: () => {},
+    currentStroke: [],
     lastFrameTime: 0,
     lastChartUpdateTime: 0,
-    
-    // Constants
-    MIN_SEGMENT_LENGTH,
-    CHART_UPDATE_THROTTLE_MS,
-    MAX_KINEMATIC_HISTORY,
-    
-    // Functions
-    finalizeAndProcessSegment: (() => {}) as typeof finalizeAndProcessSegment
+    MIN_SEGMENT_LENGTH: MIN_SEGMENT_LENGTH,
+    CHART_UPDATE_THROTTLE_MS: CHART_UPDATE_THROTTLE_MS,
+    MAX_KINEMATIC_HISTORY: MAX_KINEMATIC_HISTORY,
+    processPoint: () => {},
+    smoothedVelocity: 0
   });
-  
-  // --- Basic Drawing Utility ---
-  const drawLandmarks = (ctx: CanvasRenderingContext2D, landmarks: NormalizedLandmark[]) => {
-      if (!landmarks) return;
-      // Simple drawing: draw circles for landmarks (index finger tip: 8)
-      ctx.fillStyle = '#FF0000'; // Red
-      ctx.strokeStyle = '#00FF00'; // Green for connectors (optional)
-      ctx.lineWidth = 2;
 
-      landmarks.forEach((landmark: NormalizedLandmark, index: number) => {
-          const x = landmark.x * ctx.canvas.width;
-          const y = landmark.y * ctx.canvas.height;
-          ctx.beginPath();
-          ctx.arc(x, y, 5, 0, 2 * Math.PI); // Draw circle
-          ctx.fill();
-          // Highlight index finger tip (landmark 8)
-          if (index === 8) {
-             ctx.fillStyle = '#0000FF'; // Blue
-             ctx.beginPath();
-             ctx.arc(x, y, 7, 0, 2 * Math.PI);
-             ctx.fill();
-             ctx.fillStyle = '#FF0000'; // Reset color
-          }
-      });
-      // Add drawing connectors if needed (e.g., using HandLandmarker.HAND_CONNECTIONS)
+  // Configuration for the segmentation hook
+  const segmentationConfig = {
+    minPauseDurationMs: 120,
+    velocityThreshold: 0.15,
+    positionVarianceThreshold: 0.015,
+    // Using hook defaults for other parameters
   };
-
-  // Update loop dependencies ref after each render to avoid stale closures
-  useLayoutEffect(() => {
-    loopDependenciesRef.current = {
-      // State values
-      isSessionActive,
-      velocityHistory,
-      
-      // State Setters
-      setCurrentPath,
-      setCompletedSegments,
-      setCurrentSpeed,
-      setVelocityHistory,
-      
-      // Refs (instances)
-      positionFilters: positionFiltersRef.current,
-      velocityFilter: velocityFilterRef.current,
-      currentStroke: currentStrokeRef.current,
-      lastFrameTime: lastFrameTimeRef.current,
-      lastChartUpdateTime: lastChartUpdateTimeRef.current,
-      
-      // Constants
-      MIN_SEGMENT_LENGTH,
-      CHART_UPDATE_THROTTLE_MS,
-      MAX_KINEMATIC_HISTORY,
-      
-      // Functions
-      finalizeAndProcessSegment
-    };
-  }); // No dependency array - runs after every render
 
   // Helper function to determine the next digit based on localStorage counts
   const determineNextDigit = (): number => {
@@ -930,7 +236,6 @@ const HandTracker: React.FC = () => {
     if (isTrainingMode && (digitToDraw === null || !pathToSend || pathToSend.length < 2)) {
          console.warn("Cannot submit drawing - no prompted digit or invalid path.");
          // Reset state partially?
-         setCurrentPath([]);
          setDigitToDraw(null); // Force fetch next
          return;
     }
@@ -1014,45 +319,40 @@ const HandTracker: React.FC = () => {
     }
     
     // Reset current path and prediction for both modes
-    setCurrentPath([]);
-    setPredictedDigit(null);
+    setDigitToDraw(null);
     setPredictionConfidence(null);
     
-  }, [digitToDraw, setCurrentPath, setDigitToDraw, fetchNextDigit, ws, isTrainingMode]);
+  }, [digitToDraw, setDigitToDraw, fetchNextDigit, ws, isTrainingMode]);
 
-  // Now define finalizeAndProcessSegment which uses submitDrawing
-  const finalizeAndProcessSegment = useCallback((segmentPoints: Array<{ x: number; y: number; z?: number; t: number }>) => {
-    console.log("Finalizing Segment. Current isSessionActive:", isSessionActive);
-    
-    // Check if segment has enough points
+  // Define the segment completion handler
+  const handleSegmentComplete = useCallback((segmentPoints: Array<{ x: number; y: number; z?: number; t: number }>) => {
+    console.log(`Segment Complete received in HandTracker with ${segmentPoints.length} points.`);
+
+    // Check if segment has enough points (redundant if hook checks, but safe)
     if (segmentPoints.length < MIN_SEGMENT_LENGTH) {
-      console.log(`Segment too short (${segmentPoints.length} points), ignoring.`);
+      console.log(`HandTracker: Segment too short, ignoring.`);
       return;
     }
 
-    console.log(`Processing segment with ${segmentPoints.length} points.`);
-    
-    // Store a copy of the segment before normalization
+    // Store a copy for persistent drawing
     setCompletedSegments(prev => [...prev, [...segmentPoints]]);
 
-    // Normalize the segment (translate so first point is at origin)
+    // Normalize the segment
     const firstPoint = segmentPoints[0];
-    const normalizedPoints: Point[] = segmentPoints.map(p => ({
+    const normalizedPoints = segmentPoints.map(p => ({
       x: p.x - firstPoint.x,
       y: p.y - firstPoint.y,
       z: p.z !== undefined ? p.z - (firstPoint.z ?? 0) : undefined
     }));
-    
-    // Format the processed segment for prediction or saving
+
+    // Send for prediction or save for training based on mode
     if (isTrainingMode) {
-      // In training mode, save the segment with the current digit label
       if (digitToDraw !== null) {
+        // Assuming submitDrawing handles saving locally & fetching next
         submitDrawing(normalizedPoints);
       }
-    } else {
-      // In prediction mode, send to backend for prediction
-      setPrediction(null); // Clear previous prediction while waiting
-      
+    } else { // Prediction Mode
+      setPrediction(null); // Clear previous prediction
       if (ws && ws.readyState === WebSocket.OPEN) {
         try {
           const dataToSend = JSON.stringify({ path: normalizedPoints });
@@ -1065,24 +365,70 @@ const HandTracker: React.FC = () => {
         console.warn("WebSocket not open, cannot get prediction");
       }
     }
+
+    // Clear the temporary visual path
     
-    // Clear current path for visualization
-    setCurrentPath([]);
-    
-    // Clear the active stroke buffer and reset state
-    currentStrokeRef.current = []; 
-    
-    console.log("Segment finalized.");
-  }, [
-    isSessionActive,
-    isTrainingMode,
-    digitToDraw,
-    setCompletedSegments,
-    setCurrentPath,
-    setPrediction,
-    ws,
-    submitDrawing
-  ]);
+  }, [isTrainingMode, digitToDraw, setCompletedSegments, ws, submitDrawing, setPrediction]);
+
+  // Initialize the segmentation hook
+  const { processPoint, resetSegmentation, drawingPhase, currentStrokeInternal, smoothedVelocity } = useSegmentation({
+    config: segmentationConfig,
+    onSegmentComplete: handleSegmentComplete,
+    isSessionActive
+  });
+
+  // --- Basic Drawing Utility ---
+  const drawLandmarks = (ctx: CanvasRenderingContext2D, landmarks: NormalizedLandmark[]) => {
+      if (!landmarks) return;
+      // Simple drawing: draw circles for landmarks (index finger tip: 8)
+      ctx.fillStyle = '#FF0000'; // Red
+      ctx.strokeStyle = '#00FF00'; // Green for connectors (optional)
+      ctx.lineWidth = 2;
+
+      landmarks.forEach((landmark: NormalizedLandmark, index: number) => {
+          const x = landmark.x * ctx.canvas.width;
+          const y = landmark.y * ctx.canvas.height;
+          ctx.beginPath();
+          ctx.arc(x, y, 5, 0, 2 * Math.PI); // Draw circle
+          ctx.fill();
+          // Highlight index finger tip (landmark 8)
+          if (index === 8) {
+             ctx.fillStyle = '#0000FF'; // Blue
+             ctx.beginPath();
+             ctx.arc(x, y, 7, 0, 2 * Math.PI);
+             ctx.fill();
+             ctx.fillStyle = '#FF0000'; // Reset color
+          }
+      });
+      // Add drawing connectors if needed (e.g., using HandLandmarker.HAND_CONNECTIONS)
+  };
+
+  // Update loop dependencies ref after each render to avoid stale closures
+  useLayoutEffect(() => {
+    loopDependenciesRef.current = {
+      // State values
+      isSessionActive,
+      
+      // State Setters
+      // setCurrentPath,
+      setCompletedSegments,
+      setVelocityHistory,
+      
+      // Refs (instances)
+      currentStroke: currentStrokeRef.current,
+      lastFrameTime: lastFrameTimeRef.current,
+      lastChartUpdateTime: lastChartUpdateTimeRef.current,
+      
+      // Constants
+      MIN_SEGMENT_LENGTH,
+      CHART_UPDATE_THROTTLE_MS,
+      MAX_KINEMATIC_HISTORY,
+      
+      // Hook function and state
+      processPoint,
+      smoothedVelocity: smoothedVelocity ?? 0 // Provide default value
+    };
+  });
 
   // --- WebSocket Connection Management ---
   useEffect(() => {
@@ -1219,7 +565,6 @@ const HandTracker: React.FC = () => {
     console.log(`Starting drawing session${isTrainingMode ? ` for digit: ${digitToDraw}` : ''}`);
     
     // Reset all relevant buffers and states for a new session
-    setCurrentPath([]);
     setCompletedSegments([]); // Reset persistent paths
     setPredictedDigit(null);
     setPredictionConfidence(null);
@@ -1228,45 +573,42 @@ const HandTracker: React.FC = () => {
     console.log("handleStartSession called: isSessionActive set to true");
     
     // Reset Kalman filter for new drawing (keeping for comparison/legacy)
-    kalmanFilterRef.current = null;
-    
-    // Reset filtering components
-    positionFiltersRef.current.forEach(filter => filter.reset());
-    velocityFilterRef.current.reset();
+    // kalmanFilterRef.current = null;
     
     // Clear current stroke
     currentStrokeRef.current = [];
     
     // Reset kinematic data
     setVelocityHistory([]);
-    setCurrentSpeed(0);
     
-  }, [webcamRunning, digitToDraw, isTrainingMode]);
+    // Reset segmentation
+    resetSegmentation();
+    
+  }, [webcamRunning, digitToDraw, isTrainingMode, resetSegmentation]);
 
   const handleEndSession = useCallback(() => {
     if (!isSessionActive) return; 
     console.log(`Ending drawing session...`);
     
-    // Process the final segment if it has enough points
-    if (currentStrokeRef.current.length >= MIN_SEGMENT_LENGTH) {
-      // Finalize the current stroke
-      finalizeAndProcessSegment([...currentStrokeRef.current]);
-    }
+    // Process the final segment if it has enough points - now handled by the hook
     
     setIsSessionActive(false);
     console.log("handleEndSession called: isSessionActive set to false");
     
     // Reset Kalman filter after session ends (keeping for comparison/legacy)
-    kalmanFilterRef.current = null;
+    // kalmanFilterRef.current = null;
     
     // Clear current stroke
     currentStrokeRef.current = [];
-  }, [isSessionActive, finalizeAndProcessSegment]);
+    
+    // Reset segmentation
+    resetSegmentation();
+    
+  }, [isSessionActive, resetSegmentation]);
 
   // Also update handleResetDrawing to stop the session
   const handleResetDrawing = useCallback(() => {
     console.log("Drawing reset.");
-    setCurrentPath([]);
     setPrediction(null); // Clear prediction display
     setPredictedDigit(null);
     setPredictionConfidence(null);
@@ -1276,19 +618,14 @@ const HandTracker: React.FC = () => {
     
     // Reset kinematic data
     setVelocityHistory([]);
-    setCurrentSpeed(0);
     
     // Reset Kalman filter (keeping for comparison/legacy)
-    kalmanFilterRef.current = null;
+    // kalmanFilterRef.current = null;
     
-    // Reset new filtering components
-    positionFiltersRef.current.forEach(filter => filter.reset());
-    velocityFilterRef.current.reset();
+    // Reset segmentation
+    resetSegmentation();
     
-    // Clear current stroke
-    currentStrokeRef.current = [];
-    
-  }, []);
+  }, [resetSegmentation]);
 
   // --- Effect for MediaPipe Hand Detection and Drawing ---
   useEffect(() => {
@@ -1339,93 +676,28 @@ const HandTracker: React.FC = () => {
             t: time // Current timestamp in ms
           };
 
-          // Apply position filtering
-          const filteredPoint = {
-            x: deps.positionFilters[0].filter(rawPoint.x),
-            y: deps.positionFilters[1].filter(rawPoint.y),
-            z: deps.positionFilters[2].filter(rawPoint.z),
-            t: time
-          };
-
           // Initialize Kalman filter if needed (keeping for comparison/legacy support)
-          if (!kalmanFilterRef.current) {
-            kalmanFilterRef.current = new KalmanFilter2D(filteredPoint.x, filteredPoint.y);
-          }
+          // if (!kalmanFilterRef.current) {
+          //   kalmanFilterRef.current = new KalmanFilter2D(rawPoint.x, rawPoint.y);
+          // }
 
           // Always update the visual path if session is active
           if (deps.isSessionActive) {
-            // Add the filtered point to the visual path for display
-            deps.setCurrentPath(prevPath => [...prevPath, { x: filteredPoint.x, y: filteredPoint.y, z: filteredPoint.z }]);
+            // Store the point in currentStrokeRef for legacy code
+            currentStrokeRef.current.push(rawPoint);
             
-            // Always add point to current stroke when hand is detected and session is active
-            currentStrokeRef.current.push(filteredPoint);
+            // Process the point with the segmentation hook
+            deps.processPoint(rawPoint);
             
-            // If this is the first point in the current stroke, just continue
-            if (currentStrokeRef.current.length <= 1) {
-              return;
-            }
-            
-            // Safe velocity calculation (still kept for metrics display)
-            const lastPoint = currentStrokeRef.current[currentStrokeRef.current.length - 2]; // Get second-to-last point
-            const MIN_DT_SEC = 0.001; // Minimum time difference in seconds (1ms)
-            const dt = (filteredPoint.t - lastPoint.t) / 1000; // Convert ms to seconds
-            
-            // Handle velocity calculation
-            let rawVelocityMagnitude = 0; // Initialize with 0
-            let vx = 0, vy = 0, vz = 0;
-            
-            if (dt >= MIN_DT_SEC) {
-              // Calculate velocity components with safety checks
-              vx = (filteredPoint.x - lastPoint.x) / dt;
-              vy = (filteredPoint.y - lastPoint.y) / dt;
-              vz = (filteredPoint.z !== undefined && lastPoint.z !== undefined) 
-                ? (filteredPoint.z - lastPoint.z) / dt 
-                : 0;
-              
-              // Check for NaN or unreasonable values
-              if (isNaN(vx) || isNaN(vy) || isNaN(vz) || 
-                  !isFinite(vx) || !isFinite(vy) || !isFinite(vz)) {
-                vx = 0;
-                vy = 0;
-                vz = 0;
-                rawVelocityMagnitude = 0;
-              } else {
-                rawVelocityMagnitude = Math.sqrt(vx * vx + vy * vy + vz * vz);
-                
-                // Cap unreasonable velocities
-                const MAX_REASONABLE_VELOCITY = 3.0; // 3.0 units in normalized space
-                if (rawVelocityMagnitude > MAX_REASONABLE_VELOCITY) {
-                  const scale = MAX_REASONABLE_VELOCITY / rawVelocityMagnitude;
-                  vx *= scale;
-                  vy *= scale;
-                  vz *= scale;
-                  rawVelocityMagnitude = MAX_REASONABLE_VELOCITY;
-                }
-              }
-            }
-            
-            // Filter velocity
-            const filteredVelocity = deps.velocityFilter.filter(rawVelocityMagnitude);
-              
-            // Sanity check the filtered velocity
-            const finalVelocity = Number.isFinite(filteredVelocity) ? filteredVelocity : 0;
-            
-            // Update UI state values
-            deps.setCurrentSpeed(finalVelocity);
-            
-            // Add to chart data with throttling
-            const now = filteredPoint.t;
+            // Add to chart data with throttling (for UI only)
+            const now = rawPoint.t;
             if (now - deps.lastChartUpdateTime > deps.CHART_UPDATE_THROTTLE_MS) {
-              // Add to velocity history for charts
-              deps.setVelocityHistory(prev => {
-                const newHistory = [...prev, { t: filteredPoint.t, vx, vy, v: finalVelocity }];
-                // Trim history if it exceeds max length
+              deps.setVelocityHistory((prev: Array<{t: number; v: number}>) => {
+                const newHistory = [...prev, { t: rawPoint.t, v: deps.smoothedVelocity }];
                 return newHistory.length > deps.MAX_KINEMATIC_HISTORY 
                   ? newHistory.slice(-deps.MAX_KINEMATIC_HISTORY) 
                   : newHistory;
               });
-              
-              // Update the last chart update time
               lastChartUpdateTimeRef.current = now;
               deps.lastChartUpdateTime = now;
             }
@@ -1434,7 +706,7 @@ const HandTracker: React.FC = () => {
       } else if (deps.isSessionActive && currentStrokeRef.current.length >= deps.MIN_SEGMENT_LENGTH) {
         // No hand detected - if we've been recording, handle end of continuous stroke
         console.log('Hand lost from view - finalizing current stroke');
-        deps.finalizeAndProcessSegment([...currentStrokeRef.current]);
+        deps.processPoint(currentStrokeRef.current[currentStrokeRef.current.length - 1]);
       }
 
       // --- Drawing Code - Keeping this mostly intact for now ---
@@ -1476,18 +748,18 @@ const HandTracker: React.FC = () => {
           }
           
           // Draw the current segment with a brighter color
-          if (currentStrokeRef.current.length > 1) {
+          if (currentStrokeInternal.length > 1) {
               canvasCtx.strokeStyle = batmanTheme.primaryAccent; // Highlight current path
               canvasCtx.lineWidth = 3;
               canvasCtx.beginPath();
               canvasCtx.moveTo(
-                  currentStrokeRef.current[0].x * canvasRef.current.width, 
-                  currentStrokeRef.current[0].y * canvasRef.current.height
+                  currentStrokeInternal[0].x * canvasRef.current.width, 
+                  currentStrokeInternal[0].y * canvasRef.current.height
               );
-              for (let i = 1; i < currentStrokeRef.current.length; i++) {
+              for (let i = 1; i < currentStrokeInternal.length; i++) {
                   canvasCtx.lineTo(
-                      currentStrokeRef.current[i].x * canvasRef.current.width, 
-                      currentStrokeRef.current[i].y * canvasRef.current.height
+                      currentStrokeInternal[i].x * canvasRef.current.width, 
+                      currentStrokeInternal[i].y * canvasRef.current.height
                   );
               }
               canvasCtx.stroke();
@@ -1517,7 +789,7 @@ const HandTracker: React.FC = () => {
         cancelAnimationFrame(animationFrameId);
       }
     };
-  }, [webcamRunning, handLandmarker, latestResults, completedSegments]);
+  }, [webcamRunning, handLandmarker, latestResults, completedSegments, currentStrokeInternal, isSessionActive, processPoint]);
 
   // --- Enable/Disable Webcam ---
   const enableCam = async () => {
@@ -1792,7 +1064,7 @@ const HandTracker: React.FC = () => {
           
           <button 
             onClick={handleResetDrawing} 
-            disabled={currentPath.length === 0 || loading} 
+            disabled={currentStrokeRef.current.length === 0 || loading} 
             className="w-full px-4 py-2 bg-surface hover:bg-border text-text-primary border border-optional-accent rounded-md font-semibold transition duration-150 ease-in-out focus:outline-hidden focus:ring-3 focus:ring-offset-2 focus:ring-offset-background focus:ring-optional-accent disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-x-2"
           >
             <ArrowPathIcon className="h-5 w-5 text-optional-accent" />
@@ -1827,7 +1099,7 @@ const HandTracker: React.FC = () => {
                   <div className="bg-surface p-3 rounded-md">
                     <h5 className="text-sm font-medium text-text-titles mb-1">Current Speed</h5>
                     <p className="text-xl font-bold text-primary-accent">
-                      {currentSpeed ? currentSpeed.toFixed(4) : '0.0000'}
+                      {smoothedVelocity !== null ? smoothedVelocity.toFixed(4) : '0.0000'}
                     </p>
                   </div>
                 </div>
@@ -1852,13 +1124,10 @@ const HandTracker: React.FC = () => {
                   <h5 className="text-sm font-medium text-text-titles mb-2">Tracking Status</h5>
                   <div className="grid grid-cols-2 gap-2 text-sm">
                     <p className="text-text-primary">
-                      <span className="font-medium">Path Points:</span> {currentPath.length}
-                    </p>
-                    <p className="text-text-primary">
                       <span className="font-medium">Segment Points:</span> {currentStrokeRef.current.length}
                     </p>
                     <p className="text-text-primary">
-                      <span className="font-medium">Paused:</span> {drawingPhase === 'PAUSED' ? 'Yes' : 'No'}
+                      <span className="font-medium">Drawing Phase:</span> {drawingPhase}
                     </p>
                     <p className="text-text-primary">
                       <span className="font-medium">Recording:</span> {isSessionActive ? 'Yes' : 'No'}
