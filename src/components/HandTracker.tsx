@@ -930,6 +930,7 @@ const HandTracker: React.FC = () => {
     },
   };
 
+  // --- DIAGNOSTIC LOG --- handleStartSession entered.
   return (
     <div className="flex flex-col md:flex-row gap-4 p-4 bg-background text-text-primary min-h-screen font-sans">
       {/* Left column - Video/Canvas area */}
@@ -1077,7 +1078,10 @@ const HandTracker: React.FC = () => {
         
         <div className="flex flex-col space-y-4 mb-4">
           <button 
-            onClick={handleStartSession} 
+            onClick={() => {
+              console.log('--- DIAGNOSTIC LOG --- Button onClick triggered!');
+              handleStartSession();
+            }}
             disabled={!webcamRunning || isSessionActive || loading || (isTrainingMode && digitToDraw === null)} 
             className="w-full px-4 py-2 bg-surface hover:bg-border text-text-primary border border-primary-accent rounded-md font-semibold transition duration-150 ease-in-out focus:outline-hidden focus:ring-3 focus:ring-offset-2 focus:ring-offset-background focus:ring-primary-accent disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-x-2"
           >
