@@ -1,5 +1,7 @@
 @import "tailwindcss";
 
+@custom-variant dark (&:is(.dark *));
+
 @theme {
   /* Batman Theme Colors defined as Tailwind v4 theme tokens */
   /* These will generate utilities like bg-background, text-surface, etc. */
@@ -19,14 +21,34 @@
   --font-mono: var(--font-geist-mono);
 }
 
-/* Optional: Apply base background/text color globally using standard CSS vars */
-/* These vars (e.g., var(--color-background)) are automatically created by Tailwind */
+/* Apply base background/text color globally using standard CSS vars */
 /* from the @theme definitions above. */
 @layer base {
 body {
     background-color: var(--color-background);
     color: var(--color-text-primary);
-  font-family: Arial, Helvetica, sans-serif;
+
+    /* Shadcn UI Semantic Variable Mapping for Batman Theme */
+    --background: var(--color-background);       /* #000000 */
+    --foreground: var(--color-text-primary);     /* #E0E0E0 */
+    --card: var(--color-surface);              /* #232834 */
+    --card-foreground: var(--color-text-primary); /* #E0E0E0 */
+    --popover: var(--color-surface);           /* #232834 */
+    --popover-foreground: var(--color-text-primary);/* #E0E0E0 */
+    --primary: var(--color-primary-accent);      /* #FFD700 */
+    --primary-foreground: var(--color-background); /* #000000 - Text on primary */
+    --secondary: var(--color-secondary-accent);  /* #BA8E23 */
+    --secondary-foreground: var(--color-background); /* #000000 - Text on secondary */
+    --muted: var(--color-border);              /* #36454F - Or a slightly lighter grey */
+    --muted-foreground: var(--color-text-primary); /* #E0E0E0 - Or a slightly dimmer grey */
+    --accent: var(--color-optional-accent);      /* #003366 */
+    --accent-foreground: var(--color-text-primary); /* #E0E0E0 */
+    --destructive: oklch(0.6 0.2 20); /* Standard destructive red - adjust if needed */
+    --destructive-foreground: oklch(0.985 0 0); /* Standard light text */
+    --border: var(--color-border);              /* #36454F */
+    --input: var(--color-border);               /* #36454F - Or slightly lighter */
+    --ring: var(--color-secondary-accent);     /* #BA8E23 - Focus ring */
+    --radius: 0.5rem; /* Base border radius - adjust if needed */
   }
   /* Add other base element styles here if needed */
   h1, h2, h3, h4, h5, h6 {
