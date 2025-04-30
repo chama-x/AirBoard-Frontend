@@ -20,7 +20,7 @@ export default function HandTrackingDemo() {
       </header>
 
       {/* Render HandTracker Component */}
-      <HandTracker />
+        <HandTracker />
     </div>
   );
 } 

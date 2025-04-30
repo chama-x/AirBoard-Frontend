@@ -43,8 +43,10 @@ ChartJS.register(
 
 interface Point { x: number; y: number; z?: number; }
 type WsStatus = 'disconnected' | 'connecting' | 'connected' | 'error';
+type InteractionMode = 'idle' | 'drawing' | 'erasing';
+type Pose = InteractionMode | 'unknown';
 
-const CHART_UPDATE_THROTTLE_MS = 200;
+const CHART_UPDATE_THROTTLE_MS = 400;
 
 const MIN_SEGMENT_LENGTH = 10;
 
@@ -53,6 +55,14 @@ const TARGET_SAMPLES_PER_DIGIT = 50;
 const NUM_CLASSES = 10;
 
 const MAX_KINEMATIC_HISTORY = 100;
+
+const ERASER_RADIUS = 0.05;
+const POSE_HYSTERESIS_FRAMES = 3;
+
+// --- Pose Detection Thresholds (Normalized Coordinates) ---
+const THRESHOLD_PALM_OPEN_DIST = 0.12; // Min distance for M,R,P fingers in Open Palm
+const THRESHOLD_INDEX_POINT_DIST = 0.15; // Min distance for Index finger in Pointing pose
+const THRESHOLD_OTHER_FINGERS_DOWN_DIST = 0.10; // Max distance for M,R,P fingers in Pointing pose
 
 interface LoopDependencies {
   isSessionActive: boolean;
@@ -71,7 +81,18 @@ interface LoopDependencies {
   currentVelocityHighThreshold: number;
   elapsedReadyTime: number;
   readyAnimationDurationMs: number;
+  interactionMode: InteractionMode;
+  setInteractionMode: React.Dispatch<React.SetStateAction<InteractionMode>>;
+  poseDetectionHistory: Pose[];
+  currentStablePose: InteractionMode;
+  POSE_HYSTERESIS_FRAMES: number;
+  detectInteractionMode: (landmarks: NormalizedLandmark[]) => Pose;
 }
+
+// --- Helper Function for Distance ---
+const calculateDistance = (p1: { x: number; y: number }, p2: { x: number; y: number }): number => {
+  return Math.sqrt(Math.pow(p1.x - p2.x, 2) + Math.pow(p1.y - p2.y, 2));
+};
 
 const HandTracker: React.FC = () => {
   const [handLandmarker, setHandLandmarker] = useState<HandLandmarker | null>(null);
@@ -91,6 +112,10 @@ const HandTracker: React.FC = () => {
   
   const [velocityHistory, setVelocityHistory] = useState<Array<{t: number; v: number}>>([]);
   
+  const [interactionMode, setInteractionMode] = useState<InteractionMode>('idle');
+  const poseDetectionHistoryRef = useRef<Pose[]>([]);
+  const currentStablePoseRef = useRef<InteractionMode>('idle');
+
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const requestRef = useRef<number | null>(null);
@@ -114,7 +139,13 @@ const HandTracker: React.FC = () => {
     isReadyToDraw: false,
     currentVelocityHighThreshold: 0.015,
     elapsedReadyTime: 0,
-    readyAnimationDurationMs: 300
+    readyAnimationDurationMs: 300,
+    interactionMode: 'idle',
+    setInteractionMode: () => {},
+    poseDetectionHistory: [],
+    currentStablePose: 'idle',
+    POSE_HYSTERESIS_FRAMES: POSE_HYSTERESIS_FRAMES,
+    detectInteractionMode: () => 'unknown'
   });
 
   const segmentationConfig = {
@@ -125,6 +156,156 @@ const HandTracker: React.FC = () => {
     velocityHighThresholdMultiplier: 0.8,
     minAbsoluteHighThreshold: 0.015,
     restartCooldownMs: 100,
+  };
+
+  // --- Pose Detection Logic ---
+  const detectInteractionMode = useCallback((landmarks: NormalizedLandmark[]): Pose => {
+    if (!landmarks || landmarks.length < 21) {
+      return 'idle'; // Need all landmarks
+    }
+
+    try {
+      // Key Landmarks
+      // Remove unused variables but keep comments for clarity
+      // Wrist and thumb landmarks are defined but not used in the current logic
+      // const wrist = landmarks[0];
+      // const thumbTip = landmarks[4];
+      const indexTip = landmarks[8];
+      const middleTip = landmarks[12];
+      const ringTip = landmarks[16];
+      const pinkyTip = landmarks[20];
+
+      const indexBase = landmarks[5];
+      const middleBase = landmarks[9];
+      const ringBase = landmarks[13];
+      const pinkyBase = landmarks[17];
+
+      // Palm Center Approximation
+      const palmCenterX = (indexBase.x + middleBase.x + ringBase.x + pinkyBase.x) / 4;
+      const palmCenterY = (indexBase.y + middleBase.y + ringBase.y + pinkyBase.y) / 4;
+      const palmCenter = { x: palmCenterX, y: palmCenterY };
+
+      // Distances from Palm Center
+      const indexDist = calculateDistance(indexTip, palmCenter);
+      const middleDist = calculateDistance(middleTip, palmCenter);
+      const ringDist = calculateDistance(ringTip, palmCenter);
+      const pinkyDist = calculateDistance(pinkyTip, palmCenter);
+
+      // --- Drawing Pose Check (Index Pointing) --- FIRST
+      const isIndexPointing = indexDist > THRESHOLD_INDEX_POINT_DIST;
+      // Relaxed condition: Check if at least 2 other fingers are down
+      const downConditions = [
+          middleDist < THRESHOLD_OTHER_FINGERS_DOWN_DIST,
+          ringDist < THRESHOLD_OTHER_FINGERS_DOWN_DIST,
+          pinkyDist < THRESHOLD_OTHER_FINGERS_DOWN_DIST
+      ];
+      const sufficientOthersDown = downConditions.filter(Boolean).length >= 2;
+
+      // Optional: Check if thumb is tucked in or away from index finger
+      // const thumbIndexDist = calculateDistance(thumbTip, indexTip);
+      // if (isIndexPointing && sufficientOthersDown && thumbIndexDist > SOME_THRESHOLD) ...
+
+      if (isIndexPointing && sufficientOthersDown) {
+          // console.log("Pose Detected: Drawing (Index Pointing - Relaxed)");
+          return 'drawing';
+      }
+
+      // --- Eraser Pose Check (Open Palm) --- SECOND (only if not drawing)
+      const isMiddleOpen = middleDist > THRESHOLD_PALM_OPEN_DIST;
+      const isRingOpen = ringDist > THRESHOLD_PALM_OPEN_DIST;
+      const isPinkyOpen = pinkyDist > THRESHOLD_PALM_OPEN_DIST;
+      // const isIndexOpen = indexDist > THRESHOLD_PALM_OPEN_DIST; // Can optionally require index open too
+
+      // Stricter condition: Require Middle, Ring, AND Pinky to be open
+      if (isMiddleOpen && isRingOpen && isPinkyOpen) {
+          // If also requiring index: if (isMiddleOpen && isRingOpen && isPinkyOpen && isIndexOpen)
+          // console.log("Pose Detected: Eraser (Middle, Ring, Pinky Open)");
+          return 'erasing';
+      }
+
+      // --- Neither Pose Matched ---
+      // console.log("Pose Detected: Unknown");
+      return 'unknown';
+
+    } catch (error) {
+        console.error("Error during pose detection:", error);
+        return 'unknown'; // Return unknown on error
+    }
+  }, []); // No dependencies for now, thresholds are constants
+
+  const handleErasure = (
+    eraserPosition: { x: number; y: number },
+    eraserRadius: number,
+    currentSegments: Array<Array<{ x: number; y: number; z?: number; t: number }>>,
+    canvasWidth: number,
+    canvasHeight: number
+  ): Array<Array<{ x: number; y: number; z?: number; t: number }>> => {
+    const newSegments: Array<Array<{ x: number; y: number; z?: number; t: number }>> = [];
+    
+    // Input validation
+    if (!eraserPosition || !currentSegments || currentSegments.length === 0) {
+      return currentSegments;
+    }
+    
+    // Scale eraser coordinates and radius to pixel values
+    const scaledEraserRadius = eraserRadius * canvasWidth;
+    const scaledEraserX = eraserPosition.x * canvasWidth;
+    const scaledEraserY = eraserPosition.y * canvasHeight;
+    
+    // Process each segment
+    for (const segment of currentSegments) {
+      let pointsToKeep: Array<{ x: number; y: number; z?: number; t: number }> = [];
+      let firstHitIndex = -1;
+      
+      // Process each point in the segment
+      for (let i = 0; i < segment.length; i++) {
+        const point = segment[i];
+        const scaledPx = point.x * canvasWidth;
+        const scaledPy = point.y * canvasHeight;
+        
+        // Calculate distance squared (more efficient than using Math.sqrt)
+        const distSq = Math.pow(scaledPx - scaledEraserX, 2) + Math.pow(scaledPy - scaledEraserY, 2);
+        const isHit = distSq < Math.pow(scaledEraserRadius, 2);
+        
+        if (isHit) {
+          // Mark this point as hit by the eraser
+          if (firstHitIndex === -1) {
+            firstHitIndex = i;
+          }
+        } else {
+          // Point not hit by eraser
+          if (firstHitIndex !== -1) {
+            // We just finished a block of hits
+            // Add points collected before the hit block to new segments
+            if (pointsToKeep.length >= MIN_SEGMENT_LENGTH) {
+              newSegments.push([...pointsToKeep]);
+            }
+            
+            // Reset for the next potential segment
+            pointsToKeep = [];
+            firstHitIndex = -1;
+          }
+          
+          // Add current point to the collection
+          pointsToKeep.push(point);
+        }
+      }
+      
+      // After processing all points in the segment
+      if (firstHitIndex !== -1) {
+        // Segment ended with a hit block
+        if (pointsToKeep.length >= MIN_SEGMENT_LENGTH) {
+          newSegments.push([...pointsToKeep]);
+        }
+      } else {
+        // Segment ended normally (no hit at the end)
+        if (pointsToKeep.length >= MIN_SEGMENT_LENGTH) {
+          newSegments.push([...pointsToKeep]);
+        }
+      }
+    }
+    
+    return newSegments;
   };
 
   const determineNextDigit = (): number => {
@@ -295,7 +476,7 @@ const HandTracker: React.FC = () => {
         console.warn("WebSocket not open, cannot get prediction");
       }
     }
-
+    
   }, [isTrainingMode, digitToDraw, setCompletedSegments, ws, submitDrawing, setPrediction]);
 
   const { processPoint, resetSegmentation, drawingPhase, currentStrokeInternal, smoothedVelocity, isReadyToDraw, currentVelocityHighThreshold, elapsedReadyTime, readyAnimationDurationMs } = useSegmentation({
@@ -312,7 +493,8 @@ const HandTracker: React.FC = () => {
     smoothedVelocity: number,
     currentVelocityHighThreshold: number,
     elapsedReadyTime: number,
-    readyAnimationDurationMs: number
+    readyAnimationDurationMs: number,
+    interactionMode: InteractionMode
   ) => {
       if (!landmarks) return;
       const defaultFillStyle = '#FF0000';
@@ -327,42 +509,106 @@ const HandTracker: React.FC = () => {
       const drawingColor = batmanTheme.primaryAccent || '#FFD700'; 
       const idleColor = '#888888';
       const readyColor = batmanTheme.optionalAccent || '#003366';
+      const eraserColor = 'rgba(255, 0, 0, 0.5)';
 
+      // Draw eraser visualization if in erasing mode - OUTSIDE the landmark loop
+      // This ensures we draw only one eraser visual
+      if (interactionMode === 'erasing') {
+          try {
+              // Calculate palm center from base landmarks (more stable than fingertips)
+              // Only use the first hand's landmarks (landmarks[0] is passed to this function)
+              const indexBase = landmarks[5];
+              const middleBase = landmarks[9];
+              const ringBase = landmarks[13];
+              const pinkyBase = landmarks[17];
+
+              if (indexBase && middleBase && ringBase && pinkyBase) {
+                  const palmCenterX = (indexBase.x + middleBase.x + ringBase.x + pinkyBase.x) / 4;
+                  const palmCenterY = (indexBase.y + middleBase.y + ringBase.y + pinkyBase.y) / 4;
+                  
+                  const eraserX = palmCenterX * ctx.canvas.width;
+                  const eraserY = palmCenterY * ctx.canvas.height;
+                  const eraserPixelRadius = ERASER_RADIUS * ctx.canvas.width;
+                  
+                  // Create a pulsing effect for the eraser
+                  const pulseAmount = Math.sin(performance.now() / 300) * 0.1 + 0.9;
+                  const pulsingRadius = eraserPixelRadius * pulseAmount;
+                  
+                  // Draw eraser circle (fill)
+                  ctx.fillStyle = 'rgba(255, 100, 100, 0.2)';
+                  ctx.beginPath();
+                  ctx.arc(eraserX, eraserY, pulsingRadius, 0, 2 * Math.PI);
+                  ctx.fill();
+                  
+                  // Draw eraser border (stroke)
+                  ctx.strokeStyle = eraserColor;
+                  ctx.lineWidth = 2;
+                  ctx.beginPath();
+                  ctx.arc(eraserX, eraserY, pulsingRadius, 0, 2 * Math.PI);
+                  ctx.stroke();
+                  
+                  console.log("Drawing eraser visual at", eraserX, eraserY, "with radius", pulsingRadius);
+              }
+          } catch (error) {
+              console.error("Error drawing eraser:", error);
+          }
+      }
+
+      // Loop through landmarks to draw individual points
       landmarks.forEach((landmark: NormalizedLandmark, index: number) => {
           const x = landmark.x * ctx.canvas.width;
           const y = landmark.y * ctx.canvas.height;
 
           if (index === 8) {
+              // --- DIAGNOSTIC LOG 1 --- Log interaction mode for index 8
+              console.log(`drawLandmarks (index 8): interactionMode = ${interactionMode}`);
+
+              // Skip special index finger drawing in erasing mode
+              if (interactionMode === 'erasing') {
+                  // --- DIAGNOSTIC LOG 2 --- Log entry into erasing check block
+                  console.log("drawLandmarks (index 8): Inside erasing check, should return now.");
+
+                  // Just draw the default dot in erasing mode
+                  ctx.fillStyle = defaultFillStyle;
+                  ctx.beginPath();
+                  ctx.arc(x, y, defaultRadius, 0, 2 * Math.PI);
+                  ctx.fill();
+                  return;
+              }
+              
+              // --- DIAGNOSTIC LOG 3 --- Log proceeding to special drawing logic
+              console.log("drawLandmarks (index 8): Proceeding to special drawing logic.");
+
             const phase = drawingPhase;
             const isReady = isReadyToDraw;
-            const elapTime = elapsedReadyTime;
-            const animDuration = readyAnimationDurationMs;
+              const elapTime = elapsedReadyTime;
+              const animDuration = readyAnimationDurationMs;
 
-            ctx.fillStyle = (phase === 'DRAWING') ? drawingColor : idleColor;
-            const radius = (phase === 'DRAWING') ? drawingRadius : idleRadius;
-            ctx.beginPath();
-            ctx.arc(x, y, radius, 0, 2 * Math.PI);
-            ctx.fill();
+              ctx.fillStyle = (phase === 'DRAWING') ? drawingColor : idleColor;
+              const radius = (phase === 'DRAWING') ? drawingRadius : idleRadius;
+                ctx.beginPath();
+              ctx.arc(x, y, radius, 0, 2 * Math.PI);
+                ctx.fill();
 
-            if (phase !== 'DRAWING') {
-              const safeAnimDuration = animDuration > 0 ? animDuration : 300;
-              const animProgress = isReady ? Math.min(Math.max(elapTime / safeAnimDuration, 0), 1) : 0;
-              let outerRadius = readyMaxRadius - (animProgress * (readyMaxRadius - readyMinRadius));
-              outerRadius = Math.max(outerRadius, readyMinRadius);
+              if (phase !== 'DRAWING') {
+                  const safeAnimDuration = animDuration > 0 ? animDuration : 300;
+                const animProgress = isReady ? Math.min(Math.max(elapTime / safeAnimDuration, 0), 1) : 0;
+                let outerRadius = readyMaxRadius - (animProgress * (readyMaxRadius - readyMinRadius));
+                  outerRadius = Math.max(outerRadius, readyMinRadius);
 
-              if (isReady) {
-                  ctx.strokeStyle = readyColor;
-              } else {
-                  ctx.strokeStyle = idleColor;
-              }
-              ctx.lineWidth = 1;
-              ctx.beginPath();
-              ctx.arc(x, y, outerRadius, 0, 2 * Math.PI);
-              ctx.stroke();
+                  if (isReady) {
+                      ctx.strokeStyle = readyColor;
+                  } else {
+                      ctx.strokeStyle = idleColor;
+                  }
+                ctx.lineWidth = 1;
+                ctx.beginPath();
+                ctx.arc(x, y, outerRadius, 0, 2 * Math.PI);
+                ctx.stroke();
 
-              if (isReady) {
-                console.log(`Drawing Ready Circle: elapTime=${elapTime.toFixed(0)}, animProg=${animProgress.toFixed(2)}, outerRadius=${outerRadius.toFixed(1)}`);
-              }
+                 if (isReady) {
+                    console.log(`Drawing Ready Circle: elapTime=${elapTime.toFixed(0)}, animProg=${animProgress.toFixed(2)}, outerRadius=${outerRadius.toFixed(1)}`);
+                 }
             }
           } else {
               ctx.fillStyle = defaultFillStyle;
@@ -394,7 +640,13 @@ const HandTracker: React.FC = () => {
       MAX_KINEMATIC_HISTORY,
       
       processPoint,
-      smoothedVelocity: smoothedVelocity ?? 0
+      smoothedVelocity: smoothedVelocity ?? 0,
+      interactionMode,
+      setInteractionMode,
+      poseDetectionHistory: poseDetectionHistoryRef.current,
+      currentStablePose: currentStablePoseRef.current,
+      POSE_HYSTERESIS_FRAMES,
+      detectInteractionMode
     };
   });
 
@@ -522,7 +774,12 @@ const HandTracker: React.FC = () => {
     
     setVelocityHistory([]);
     
+    console.log("Calling resetSegmentation() due to Start Session");
     resetSegmentation();
+    
+    poseDetectionHistoryRef.current = [];
+    currentStablePoseRef.current = 'idle';
+    setInteractionMode('idle');
     
   }, [webcamRunning, digitToDraw, isTrainingMode, resetSegmentation]);
 
@@ -546,7 +803,12 @@ const HandTracker: React.FC = () => {
     
     currentStrokeRef.current = [];
     
+    console.log("Calling resetSegmentation() due to End Session");
     resetSegmentation();
+    
+    poseDetectionHistoryRef.current = [];
+    currentStablePoseRef.current = 'idle';
+    setInteractionMode('idle');
     
   }, [isSessionActive, resetSegmentation]);
 
@@ -561,7 +823,12 @@ const HandTracker: React.FC = () => {
     
     setVelocityHistory([]);
     
+    console.log("Calling resetSegmentation() due to Reset Drawing");
     resetSegmentation();
+    
+    poseDetectionHistoryRef.current = [];
+    currentStablePoseRef.current = 'idle';
+    setInteractionMode('idle');
     
   }, [resetSegmentation]);
 
@@ -581,6 +848,14 @@ const HandTracker: React.FC = () => {
     };
 
     const renderLoop = (time: number) => {
+      // --- Add explicit check for refs at the start ---
+      if (!videoRef.current || !canvasRef.current) {
+        console.warn("RenderLoop: Refs not ready, skipping frame.");
+        requestRef.current = requestAnimationFrame(renderLoop);
+        return;
+      }
+      // --- End of added check ---
+
       const deps = loopDependenciesRef.current;
       
       if (deps.lastFrameTime === 0) {
@@ -591,36 +866,155 @@ const HandTracker: React.FC = () => {
       }
 
       lastFrameTimeRef.current = time;
-      deps.lastFrameTime = time;
 
       detectHands();
 
-      if (latestResults && latestResults.landmarks && latestResults.landmarks.length > 0) {
-        const handLandmarks = latestResults.landmarks[0];
+      const currentLandmarks = latestResults?.landmarks;
+
+      if (deps.isSessionActive && currentLandmarks && currentLandmarks.length > 0) {
+          const currentFramePose = deps.detectInteractionMode(currentLandmarks[0]);
+
+          poseDetectionHistoryRef.current.push(currentFramePose);
+          if (poseDetectionHistoryRef.current.length > deps.POSE_HYSTERESIS_FRAMES) {
+             poseDetectionHistoryRef.current.shift();
+          }
+
+          let stablePose: InteractionMode | null = null;
+          if (poseDetectionHistoryRef.current.length === deps.POSE_HYSTERESIS_FRAMES) {
+              const history = poseDetectionHistoryRef.current;
+              const firstPose = history[0];
+              if (firstPose !== 'unknown' && firstPose !== 'idle' && history.every(p => p === firstPose)) {
+                  stablePose = firstPose;
+              } else if (firstPose === 'idle' && history.every(p => p === 'idle')) {
+                  stablePose = 'idle';
+              }
+          }
+
+          const currentStablePoseInRef = currentStablePoseRef.current;
+          const currentInteractionModeState = deps.interactionMode;
+
+          if (stablePose !== null) {
+              if (stablePose !== currentStablePoseInRef) {
+                  console.log(`Stable pose changed: ${currentStablePoseInRef} -> ${stablePose}`);
+                  currentStablePoseRef.current = stablePose;
+                  if (stablePose !== currentInteractionModeState) {
+                     const prevMode = currentInteractionModeState;
+                     const newMode = stablePose;
+                     deps.setInteractionMode(newMode);
+                     if ((prevMode === 'drawing' || prevMode === 'erasing') && prevMode !== newMode) {
+                         console.log(`Calling resetSegmentation() due to mode change: ${prevMode} -> ${newMode}`);
+                         resetSegmentation();
+                     }
+                  }
+              }
+          } else {
+              if (currentStablePoseInRef !== 'idle') {
+                  console.log(`Pose unstable or unknown, setting to idle.`);
+                  currentStablePoseRef.current = 'idle';
+                  if (currentInteractionModeState !== 'idle') {
+                     const prevMode = currentInteractionModeState;
+                     const newMode = 'idle';
+                     deps.setInteractionMode(newMode);
+                     if (prevMode === 'drawing' || prevMode === 'erasing') {
+                         console.log(`Calling resetSegmentation() due to pose becoming unstable/unknown (prev: ${prevMode})`);
+                         resetSegmentation();
+                     }
+                  }
+              }
+          }
+      } else {
+          if (poseDetectionHistoryRef.current.length > 0 || currentStablePoseRef.current !== 'idle') {
+             console.log('Resetting pose state (no session/landmarks)');
+             poseDetectionHistoryRef.current = [];
+             currentStablePoseRef.current = 'idle';
+             if (deps.interactionMode !== 'idle') {
+                const prevMode = deps.interactionMode;
+                const newMode = 'idle';
+                deps.setInteractionMode(newMode);
+                if (prevMode === 'drawing' || prevMode === 'erasing') {
+                     console.log(`Calling resetSegmentation() due to no session/landmarks (prev: ${prevMode})`);
+                    resetSegmentation();
+                }
+             }
+          }
+      }
+
+      if (currentLandmarks && currentLandmarks.length > 0) {
+        const handLandmarks = currentLandmarks[0];
         if (handLandmarks && handLandmarks.length > 8) {
           const indexTip = handLandmarks[8];
-          const rawPoint = {
-            x: indexTip.x,
-            y: indexTip.y,
-            z: indexTip.z,
-            t: time
-          };
+          const rawPoint = { x: indexTip.x, y: indexTip.y, z: indexTip.z, t: time };
 
           if (deps.isSessionActive) {
-            currentStrokeRef.current.push(rawPoint);
-            
+            if (deps.interactionMode === 'drawing') {
             deps.processPoint(rawPoint);
+            } else if (deps.interactionMode === 'erasing') {
+              console.log("Eraser Active at:", rawPoint.x, rawPoint.y);
+              
+              // Calculate palm center for erasing - ensure this matches the calculation in drawLandmarks
+              if (handLandmarks.length >= 21) {
+                const indexBase = handLandmarks[5];
+                const middleBase = handLandmarks[9];
+                const ringBase = handLandmarks[13];
+                const pinkyBase = handLandmarks[17];
+                
+                if (indexBase && middleBase && ringBase && pinkyBase) {
+                  const palmCenterX = (indexBase.x + middleBase.x + ringBase.x + pinkyBase.x) / 4;
+                  const palmCenterY = (indexBase.y + middleBase.y + ringBase.y + pinkyBase.y) / 4;
+                  const eraserPosition = { x: palmCenterX, y: palmCenterY };
+                  
+                  // Apply erasure and update completedSegments if needed
+                  if (completedSegments.length > 0) {
+                    try {
+                      const canvasWidth = canvasRef.current?.width || 640;
+                      const canvasHeight = canvasRef.current?.height || 480;
+                      
+                      const newSegments = handleErasure(
+                        eraserPosition, 
+                        ERASER_RADIUS, 
+                        completedSegments, 
+                        canvasWidth, 
+                        canvasHeight
+                      );
+                      
+                      // More robust comparison - check if any segment changed
+                      let hasChanged = false;
+                      
+                      // First check segment count for quick early exit
+                      if (newSegments.length !== completedSegments.length) {
+                        hasChanged = true;
+                      } else {
+                        // Check total point count as a second quick comparison
+                        const oldPointCount = completedSegments.reduce((sum, segment) => sum + segment.length, 0);
+                        const newPointCount = newSegments.reduce((sum, segment) => sum + segment.length, 0);
+                        
+                        if (oldPointCount !== newPointCount) {
+                          hasChanged = true;
+                        }
+                      }
+                      
+                      if (hasChanged) {
+                        console.log(`Eraser applied: ${completedSegments.length} segments -> ${newSegments.length} segments`);
+                        setCompletedSegments(newSegments);
+                        console.log("TEMP LOG: Completed segments after erasure (first 2):", JSON.stringify(newSegments.slice(0, 2)));
+                      }
+                    } catch (error) {
+                      console.error("Error during erasure processing:", error);
+                    }
+                  }
+                }
+              }
+            }
             
             const now = rawPoint.t;
-            if (now - deps.lastChartUpdateTime > deps.CHART_UPDATE_THROTTLE_MS) {
-              deps.setVelocityHistory((prev: Array<{t: number; v: number}>) => {
+            if (now - lastChartUpdateTimeRef.current > deps.CHART_UPDATE_THROTTLE_MS) {
+              deps.setVelocityHistory((prev) => {
                 const newHistory = [...prev, { t: rawPoint.t, v: deps.smoothedVelocity }];
                 return newHistory.length > deps.MAX_KINEMATIC_HISTORY 
                   ? newHistory.slice(-deps.MAX_KINEMATIC_HISTORY) 
                   : newHistory;
               });
               lastChartUpdateTimeRef.current = now;
-              deps.lastChartUpdateTime = now;
             }
           }
         }
@@ -654,7 +1048,8 @@ const HandTracker: React.FC = () => {
                       deps.smoothedVelocity,
                       deps.currentVelocityHighThreshold,
                       deps.elapsedReadyTime,
-                      deps.readyAnimationDurationMs
+                      deps.readyAnimationDurationMs,
+                      deps.interactionMode
                   );
               }
           }
@@ -699,6 +1094,17 @@ const HandTracker: React.FC = () => {
               canvasCtx.stroke();
           }
           
+          if (deps.interactionMode === 'erasing' && latestResults?.landmarks?.[0]?.[8]) {
+               const eraserX = latestResults.landmarks[0][8].x * canvasRef.current.width;
+               const eraserY = latestResults.landmarks[0][8].y * canvasRef.current.height;
+               const eraserPixelRadius = ERASER_RADIUS * canvasRef.current.width;
+               canvasCtx.strokeStyle = 'rgba(255, 0, 0, 0.5)';
+               canvasCtx.lineWidth = 2;
+               canvasCtx.beginPath();
+               canvasCtx.arc(eraserX, eraserY, eraserPixelRadius, 0, 2 * Math.PI);
+              canvasCtx.stroke();
+          }
+          
           canvasCtx.restore();
       }
       
@@ -713,6 +1119,11 @@ const HandTracker: React.FC = () => {
         if (canvasCtx && canvasRef.current) {
             canvasCtx.clearRect(0, 0, canvasRef.current.width, canvasRef.current.height);
         }
+        if (currentStablePoseRef.current !== 'idle') {
+             poseDetectionHistoryRef.current = [];
+             currentStablePoseRef.current = 'idle';
+             setInteractionMode('idle');
+        }
     }
 
     return () => {
@@ -720,7 +1131,7 @@ const HandTracker: React.FC = () => {
         cancelAnimationFrame(animationFrameId);
       }
     };
-  }, [webcamRunning, handLandmarker, latestResults, completedSegments, currentStrokeInternal, isSessionActive, processPoint]);
+  }, [webcamRunning, handLandmarker, latestResults, completedSegments, currentStrokeInternal, isSessionActive, processPoint, detectInteractionMode, interactionMode]);
 
   const enableCam = async () => {
       if (!handLandmarker || webcamRunning) return;
@@ -760,6 +1171,10 @@ const HandTracker: React.FC = () => {
           cancelAnimationFrame(requestRef.current);
           requestRef.current = null;
       }
+      
+      poseDetectionHistoryRef.current = [];
+      currentStablePoseRef.current = 'idle';
+      setInteractionMode('idle');
   };
 
   const speedChartData = useMemo(() => ({
@@ -832,28 +1247,35 @@ const HandTracker: React.FC = () => {
   } else if (!webcamRunning) {
     statusContent = "Enable Webcam to Begin";
   } else if (isSessionActive) {
-    switch (drawingPhase) {
-      case 'DRAWING':
-        statusContent = "Tracking...";
-        statusColor = "text-yellow-400";
-        break;
-      case 'PAUSED':
-        statusContent = "Processing..."; 
-        break;
-      case 'IDLE':
-        break;
-    }
-    if (!statusContent && isReadyToDraw) {
-      statusContent = "Ready";
-      statusColor = "text-blue-400";
-    }
-    if (!statusContent && drawingPhase === 'IDLE') { 
-        if (isTrainingMode && digitToDraw !== null) {
-          statusContent = <>Draw Digit: <span className="text-primary-accent font-bold">{digitToDraw}</span></>;
-          statusColor = "text-text-titles";
-        } else {
-          statusContent = "Position Hand in View";
+    if (interactionMode === 'erasing') {
+        statusContent = "Erasing...";
+        statusColor = "text-red-500";
+    } else if (interactionMode === 'drawing') {
+        switch (drawingPhase) {
+            case 'DRAWING':
+                statusContent = "Tracking...";
+                statusColor = "text-yellow-400";
+                break;
+            case 'IDLE':
+                if (isReadyToDraw) {
+                   statusContent = "Ready";
+                   statusColor = "text-blue-400";
+                } else if (isTrainingMode && digitToDraw !== null) {
+                   statusContent = <>Draw Digit: <span className="text-primary-accent font-bold">{digitToDraw}</span></>;
+                   statusColor = "text-text-titles";
+                } else {
+                   statusContent = "Position Hand to Draw";
+                }
+                break;
+            case 'PAUSED':
+                statusContent = "Processing...";
+                break;
+            default:
+                 statusContent = "Position Hand to Draw";
+                 break;
         }
+    } else {
+        statusContent = "Pose: Idle";
     }
   } else {
     if (isTrainingMode && digitToDraw !== null) {
@@ -862,12 +1284,13 @@ const HandTracker: React.FC = () => {
     } else if (!isTrainingMode) {
       statusContent = "Ready to Predict";
     } else {
-        statusContent = "Fetching next digit..."; 
+        statusContent = "Fetching next digit...";
     }
   }
   
   if (!statusContent) {
     statusContent = "Position Hand in View";
+    statusColor = "text-text-secondary";
   }
 
   return (
@@ -897,21 +1320,21 @@ const HandTracker: React.FC = () => {
               <p className={`text-xl font-bold ${statusColor}`}>
                 {statusContent}
               </p>
-            </div>
+                  </div>
 
             <div className="w-1/3 text-right"> 
               {!isTrainingMode && prediction !== null && (
-                <div>
+                  <div>
                   <p className="text-sm text-muted-foreground mb-1">Prediction</p> 
                   <div className="text-4xl font-bold text-primary-accent">{prediction}</div>
                   {predictionConfidence !== null && (
                     <p className="text-xs text-muted-foreground mt-1"> 
                       Confidence: {(predictionConfidence * 100).toFixed(1)}%
-                    </p>
-                  )}
-                </div>
-              )}
-            </div>
+                      </p>
+                    )}
+                  </div>
+                )}
+              </div>
           </div>
         </div>
         
@@ -923,7 +1346,7 @@ const HandTracker: React.FC = () => {
         ) : (
           <div className={cn(
             "relative mx-auto",
-            isSessionActive && drawingPhase === 'DRAWING' && 'border-2 border-yellow-400 shadow-[0_0_15px_rgba(250,204,21,0.5)] transition-all duration-300'
+            isSessionActive && interactionMode === 'drawing' && drawingPhase === 'DRAWING' && 'border-2 border-yellow-400 shadow-[0_0_15px_rgba(250,204,21,0.5)] transition-all duration-300'
           )}>
             <video 
               ref={videoRef}
@@ -993,18 +1416,18 @@ const HandTracker: React.FC = () => {
       <div className="w-full md:w-1/2 lg:w-2/5 bg-surface p-6 rounded-md shadow-md">
         <h3 className="text-2xl font-semibold mb-6 text-text-titles border-b border-border pb-3">Controls</h3>
         
-        <button 
-          onClick={() => {
-            console.log('--- DIAGNOSTIC LOG --- Lambda onClick triggered. Calling handleStartSession:', handleStartSession);
-            handleStartSession();
-          }}
-          disabled={!webcamRunning || isSessionActive || loading || (isTrainingMode && digitToDraw === null)} 
+          <button 
+            onClick={() => {
+              console.log('--- DIAGNOSTIC LOG --- Lambda onClick triggered. Calling handleStartSession:', handleStartSession);
+              handleStartSession();
+            }}
+            disabled={!webcamRunning || isSessionActive || loading || (isTrainingMode && digitToDraw === null)} 
           className="bg-yellow-400 hover:bg-yellow-500 text-black font-bold rounded-md py-3 text-lg w-full flex items-center justify-center gap-2 mb-4 disabled:opacity-50 disabled:cursor-not-allowed"
-        >
+          >
           <PlayIcon className="h-5 w-5" />
-          Start Session
-        </button>
-        
+            Start Session
+          </button>
+          
         <div className="mt-6 pt-6 border-t border-border">
           <div className="flex items-center justify-between">
             <label htmlFor="training-mode" className="text-text-secondary">Training Mode</label>
@@ -1028,7 +1451,7 @@ const HandTracker: React.FC = () => {
           
           <button 
             onClick={handleResetDrawing} 
-            disabled={completedSegments.length === 0 && currentStrokeInternal.length === 0 || loading}
+            disabled={(completedSegments.length === 0 && currentStrokeInternal.length === 0) || loading}
             className="bg-surface hover:bg-muted border border-border text-text-secondary rounded-md py-2 w-full flex items-center justify-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed"
           >
             <ArrowPathIconSolid className="h-5 w-5" />
