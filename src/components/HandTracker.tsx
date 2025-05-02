@@ -553,12 +553,7 @@ const HandTracker: React.FC = () => {
                   // --- DIAGNOSTIC LOG 2 --- Log entry into erasing check block
                   console.log("drawLandmarks (index 8): Inside erasing check, should return now.");
 
-                  // Just draw the default dot in erasing mode
-                  ctx.fillStyle = defaultFillStyle;
-                  ctx.beginPath();
-                  ctx.arc(x, y, defaultRadius, 0, 2 * Math.PI);
-                  ctx.fill();
-                  return;
+                  return; // Skip drawing anything specific for index 8 in erase mode
               }
               
               // --- DIAGNOSTIC LOG 3 --- Log proceeding to special drawing logic
