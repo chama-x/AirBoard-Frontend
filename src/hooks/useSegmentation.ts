@@ -47,7 +47,7 @@ const defaultConfig: SegmentationConfig = {
     velocityHistoryMaxSize: 100, 
     reasonableMaxSpeed: 3.0,
     velocityHighThresholdMultiplier: 1.5, 
-    minAbsoluteHighThreshold: 0.18,
+    minAbsoluteHighThreshold: 0.14,
     restartCooldownMs: 150,
     minRestartDistance: 0.05,
     readyAnimationDurationMs: 50,
@@ -455,7 +455,6 @@ export function useSegmentation({
 
                 if (
                     isReadyToDraw && // Must be (still) ready
-                    elapsedReadyTimeInternal >= config.readyAnimationDurationMs && // Animation time elapsed
                     smoothedVelocity > velocityHighThreshold // Velocity threshold met
                 ) {
                     // --- Transition to DRAWING ---
