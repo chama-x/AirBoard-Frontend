@@ -34,6 +34,29 @@ interface SegmentationConfig {
     velocityFilterAlpha: number;
 }
 
+// Define defaultConfig outside the hook
+const defaultConfig: SegmentationConfig = {
+    minPauseDurationMs: 120, 
+    velocityThreshold: 0.15, 
+    positionVarianceThreshold: 0.015,
+    bufferSize: 10, 
+    minPointsForVariance: 5, 
+    varianceWindowSize: 5,
+    velocityHistoryWindowMs: 500, 
+    velocityHistoryDefaultThreshold: 0.05,
+    velocityHistoryMaxSize: 100, 
+    reasonableMaxSpeed: 3.0,
+    velocityHighThresholdMultiplier: 1.5, 
+    minAbsoluteHighThreshold: 0.02,
+    restartCooldownMs: 150,
+    minRestartDistance: 0.05,
+    readyAnimationDurationMs: 50,
+    minSegmentLength: 10, 
+    minDtSec: 0.001,
+    positionFilterAlpha: 0.2, 
+    velocityFilterAlpha: 0.3,
+};
+
 // Input point structure expected by the hook
 interface InputPoint extends Point { t: number; } // Timestamp in ms
 
@@ -291,28 +314,6 @@ export function useSegmentation({
     isSessionActive 
 }: UseSegmentationProps): UseSegmentationReturn {
     // Define and merge configuration with defaults
-    const defaultConfig: SegmentationConfig = {
-        minPauseDurationMs: 120, 
-        velocityThreshold: 0.15, 
-        positionVarianceThreshold: 0.015,
-        bufferSize: 10, 
-        minPointsForVariance: 5, 
-        varianceWindowSize: 5,
-        velocityHistoryWindowMs: 500, 
-        velocityHistoryDefaultThreshold: 0.05,
-        velocityHistoryMaxSize: 100, 
-        reasonableMaxSpeed: 3.0,
-        velocityHighThresholdMultiplier: 1.5, 
-        minAbsoluteHighThreshold: 0.02,
-        restartCooldownMs: 150,
-        minRestartDistance: 0.05,
-        readyAnimationDurationMs: 300,
-        minSegmentLength: 10, 
-        minDtSec: 0.001,
-        positionFilterAlpha: 0.2, 
-        velocityFilterAlpha: 0.3,
-    };
-    
     const config = useMemo(() => ({ ...defaultConfig, ...userConfig }), [userConfig]);
     
     // State
@@ -411,6 +412,9 @@ export function useSegmentation({
         
         // Check if currently paused
         const isCurrentlyPaused = pauseDetectorRef.current.isPaused(filteredPoint.t);
+
+        // --- Log 1: Point Processed ---
+        console.log(`useSegmentation - Point Processed: t=${filteredPoint.t.toFixed(0)}, vel=${smoothedVelocity.toFixed(3)}, highThreshold=${velocityHighThresholdRef.current.toFixed(3)}, phase=${drawingPhase}, ready=${isReadyToDraw}`);
         
         // State machine
         switch (drawingPhase) {
@@ -443,13 +447,18 @@ export function useSegmentation({
                 // Check conditions for transitioning to DRAWING
                 const elapsedReadyTimeInternal = isReadyToDraw && readyStartTimeRef.current ? filteredPoint.t - readyStartTimeRef.current : 0;
 
+                // --- Log 2: IDLE Check ---
+                console.log(`useSegmentation (IDLE Check): ready=${isReadyToDraw}, elapsed=${elapsedReadyTimeInternal.toFixed(0)}, animDur=${config.readyAnimationDurationMs}, vel=${smoothedVelocity.toFixed(3)}, threshold=${velocityHighThresholdRef.current.toFixed(3)}`);
+
                 if (
                     isReadyToDraw && // Must be (still) ready
                     elapsedReadyTimeInternal >= config.readyAnimationDurationMs && // Animation time elapsed
                     smoothedVelocity > velocityHighThreshold // Velocity threshold met
                 ) {
                     // --- Transition to DRAWING ---
-                    console.log('Transitioning: IDLE(Ready) -> DRAWING'); // Log transition
+                    // console.log('Transitioning: IDLE(Ready) -> DRAWING'); // Original Log transition replaced below
+                    // --- Log 3: Transition IDLE -> DRAWING ---
+                    console.log(`useSegmentation: Transitioning IDLE -> DRAWING (vel=${smoothedVelocity.toFixed(3)} > threshold=${velocityHighThresholdRef.current.toFixed(3)})`);
                     setDrawingPhase('DRAWING');
                     setIsReadyToDraw(false); // Exit ready state
                     readyStartTimeRef.current = null; // Reset timer
@@ -467,7 +476,9 @@ export function useSegmentation({
                     setDrawingPhase('IDLE');
                     internalStrokeRef.current = [];
                 } else if (isCurrentlyPaused) {
-                    console.log('Transitioning: DRAWING -> IDLE (via PAUSED)', { isCurrentlyPaused });
+                    // console.log('Transitioning: DRAWING -> IDLE (via PAUSED)', { isCurrentlyPaused }); // Original Log replaced below
+                    // --- Log 4: Transition DRAWING -> IDLE (Pause) ---
+                    console.log(`useSegmentation: Transitioning DRAWING -> IDLE (Pause detected)`);
                     
                     if (internalStrokeRef.current.length >= config.minSegmentLength) {
                         console.log(`Segment complete: ${internalStrokeRef.current.length} points`);
@@ -502,9 +513,10 @@ export function useSegmentation({
                 break;
         }
         
-    }, [config, isSessionActive, drawingPhase, onSegmentComplete]);
+    }, [config, isSessionActive, drawingPhase, isReadyToDraw, onSegmentComplete]);
 
     // Reset segmentation state
+    // isReadyToDraw is set, not read, no need for dependency
     const resetSegmentation = useCallback(() => {
         setDrawingPhase('IDLE');
         internalStrokeRef.current = [];
