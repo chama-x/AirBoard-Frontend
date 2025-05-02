@@ -47,7 +47,7 @@ const defaultConfig: SegmentationConfig = {
     velocityHistoryMaxSize: 100, 
     reasonableMaxSpeed: 3.0,
     velocityHighThresholdMultiplier: 1.5, 
-    minAbsoluteHighThreshold: 0.02,
+    minAbsoluteHighThreshold: 0.12,
     restartCooldownMs: 150,
     minRestartDistance: 0.05,
     readyAnimationDurationMs: 50,

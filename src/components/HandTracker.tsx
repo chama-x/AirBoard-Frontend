@@ -60,7 +60,7 @@ const ERASER_RADIUS = 0.05;
 const POSE_HYSTERESIS_FRAMES = 6;
 
 // --- Pose Detection Thresholds (Normalized Coordinates) ---
-const THRESHOLD_PALM_OPEN_DIST = 0.12; // Min distance for M,R,P fingers in Open Palm
+const THRESHOLD_PALM_OPEN_DIST = 0.14; // Increased substantially
 const THRESHOLD_INDEX_POINT_DIST = 0.15; // Min distance for Index finger in Pointing pose
 const THRESHOLD_OTHER_FINGERS_DOWN_DIST = 0.10; // Max distance for M,R,P fingers in Pointing pose
 
