@@ -320,6 +320,9 @@ export function useSegmentation({
     const [drawingPhase, setDrawingPhase] = useState<DrawingPhase>('IDLE');
     const [isReadyToDraw, setIsReadyToDraw] = useState(false);
     
+    // Ref to hold the *current intended* internal state, updated synchronously
+    const internalStateRef = useRef<{ drawingPhase: DrawingPhase }>({ drawingPhase: 'IDLE' });
+    
     // Refs
     const internalStrokeRef = useRef<PointWithTime[]>([]);
     const positionFiltersRef = useRef([
@@ -413,11 +416,11 @@ export function useSegmentation({
         // Check if currently paused
         const isCurrentlyPaused = pauseDetectorRef.current.isPaused(filteredPoint.t);
 
-        // --- Log 1: Point Processed ---
-        console.log(`useSegmentation - Point Processed: t=${filteredPoint.t.toFixed(0)}, vel=${smoothedVelocity.toFixed(3)}, highThreshold=${velocityHighThresholdRef.current.toFixed(3)}, phase=${drawingPhase}, ready=${isReadyToDraw}`);
+        // --- Log 1: Point Processed --- (Using internal ref for phase)
+        console.log(`useSegmentation - Point Processed: t=${filteredPoint.t.toFixed(0)}, vel=${smoothedVelocity.toFixed(3)}, highThreshold=${velocityHighThresholdRef.current.toFixed(3)}, phase=${internalStateRef.current.drawingPhase}, ready=${isReadyToDraw}`);
         
-        // State machine
-        switch (drawingPhase) {
+        // State machine (Using internal ref for phase logic)
+        switch (internalStateRef.current.drawingPhase) {
             case 'IDLE':
                 // Calculate readiness prerequisites (distance & time cooldown)
                 let isFarEnough = !lastSegmentEndPointRef.current; // True if no previous point
@@ -459,7 +462,8 @@ export function useSegmentation({
                     // console.log('Transitioning: IDLE(Ready) -> DRAWING'); // Original Log transition replaced below
                     // --- Log 3: Transition IDLE -> DRAWING ---
                     console.log(`useSegmentation: Transitioning IDLE -> DRAWING (vel=${smoothedVelocity.toFixed(3)} > threshold=${velocityHighThresholdRef.current.toFixed(3)})`);
-                    setDrawingPhase('DRAWING');
+                    setDrawingPhase('DRAWING'); // Update state for external consumers
+                    internalStateRef.current.drawingPhase = 'DRAWING'; // Update internal ref SYNCHRONOUSLY
                     setIsReadyToDraw(false); // Exit ready state
                     readyStartTimeRef.current = null; // Reset timer
                     internalStrokeRef.current = [filteredPoint];
@@ -474,6 +478,7 @@ export function useSegmentation({
                 if (!isSessionActive) {
                     console.log('Session became inactive during DRAWING, resetting to IDLE');
                     setDrawingPhase('IDLE');
+                    internalStateRef.current.drawingPhase = 'IDLE'; // Update internal ref
                     internalStrokeRef.current = [];
                 } else if (isCurrentlyPaused) {
                     // console.log('Transitioning: DRAWING -> IDLE (via PAUSED)', { isCurrentlyPaused }); // Original Log replaced below
@@ -495,7 +500,8 @@ export function useSegmentation({
 
                     lastPauseTimeRef.current = filteredPoint.t;
                     internalStrokeRef.current = [];
-                    setDrawingPhase('IDLE');
+                    setDrawingPhase('IDLE'); // Update state for external consumers
+                    internalStateRef.current.drawingPhase = 'IDLE'; // Update internal ref SYNCHRONOUSLY
                     setIsReadyToDraw(false); // Reset readiness flag
                     readyStartTimeRef.current = null; // Reset ready timer
                 } else {
@@ -510,6 +516,7 @@ export function useSegmentation({
                 // Should not be reachable with current implementation
                 console.warn('Unexpected PAUSED state reached');
                 setDrawingPhase('IDLE');
+                internalStateRef.current.drawingPhase = 'IDLE'; // Update internal ref
                 break;
         }
         
@@ -518,7 +525,8 @@ export function useSegmentation({
     // Reset segmentation state
     // isReadyToDraw is set, not read, no need for dependency
     const resetSegmentation = useCallback(() => {
-        setDrawingPhase('IDLE');
+        setDrawingPhase('IDLE'); // Update state for external consumers
+        internalStateRef.current.drawingPhase = 'IDLE'; // Update internal ref SYNCHRONOUSLY
         internalStrokeRef.current = [];
         positionFiltersRef.current.forEach(filter => filter.reset());
         velocityFilterRef.current.reset();
