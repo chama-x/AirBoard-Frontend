@@ -504,8 +504,6 @@ const HandTracker: React.FC = () => {
 
       const idleRadius = 3;
       const drawingRadius = 7;
-      const readyMinRadius = idleRadius;
-      const readyMaxRadius = 15;
       
       const drawingColor = batmanTheme.primaryAccent || '#FFD700'; 
       const idleColor = '#888888';
@@ -568,15 +566,29 @@ const HandTracker: React.FC = () => {
 
             const phase = drawingPhase;
             const isReady = isReadyToDraw;
-              const elapTime = elapsedReadyTime;
-              const animDuration = readyAnimationDurationMs;
+              // const elapTime = elapsedReadyTime; // No longer needed for animation
+              // const animDuration = readyAnimationDurationMs; // No longer needed for animation
 
-              ctx.fillStyle = (phase === 'DRAWING') ? drawingColor : idleColor;
-              const radius = (phase === 'DRAWING') ? drawingRadius : idleRadius;
-                ctx.beginPath();
-              ctx.arc(x, y, radius, 0, 2 * Math.PI);
-                ctx.fill();
+              // Determine color and radius based on state
+              let dotColor = idleColor;
+              let dotRadius = idleRadius;
 
+              if (phase === 'DRAWING') {
+                  dotColor = drawingColor;
+                  dotRadius = drawingRadius;
+              } else if (isReady) {
+                  dotColor = readyColor; 
+                  dotRadius = drawingRadius; // Use a slightly larger radius for ready state
+              }
+
+              // Draw the central dot
+              ctx.fillStyle = dotColor;
+              ctx.beginPath();
+              ctx.arc(x, y, dotRadius, 0, 2 * Math.PI);
+              ctx.fill();
+
+              // REMOVED Animation block
+              /*
               if (phase !== 'DRAWING') {
                   const safeAnimDuration = animDuration > 0 ? animDuration : 300;
                 const animProgress = isReady ? Math.min(Math.max(elapTime / safeAnimDuration, 0), 1) : 0;
@@ -597,6 +609,7 @@ const HandTracker: React.FC = () => {
                     console.log(`Drawing Ready Circle: elapTime=${elapTime.toFixed(0)}, animProg=${animProgress.toFixed(2)}, outerRadius=${outerRadius.toFixed(1)}`);
                  }
             }
+            */
           } else {
               ctx.fillStyle = defaultFillStyle;
               ctx.beginPath();
