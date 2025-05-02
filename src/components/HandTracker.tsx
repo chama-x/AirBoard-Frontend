@@ -959,8 +959,11 @@ const HandTracker: React.FC = () => {
       // This check is best placed *after* the mode setting logic
       if (deps.drawingPhase === 'IDLE' && previousDrawingPhaseRef.current === 'DRAWING') {
         if (deps.interactionMode === 'drawing') { // Only reset if we *were* in drawing mode
-          console.log("Natural Pause Detected (DrawingPhase IDLE from DRAWING), resetting segmentation...");
+          console.log("Natural Pause Detected (DrawingPhase IDLE from DRAWING), resetting segmentation and interactionMode...");
           resetSegmentation();
+          deps.setInteractionMode('idle'); // Explicitly set interactionMode back to idle
+          currentStablePoseRef.current = 'idle'; // Also reset stable pose ref to prevent immediate re-entry
+          poseDetectionHistoryRef.current = []; // Clear history too
         }
       }
       previousDrawingPhaseRef.current = deps.drawingPhase; // Update for next frame
