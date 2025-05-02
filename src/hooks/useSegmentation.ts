@@ -37,7 +37,7 @@ interface SegmentationConfig {
 // Define defaultConfig outside the hook
 const defaultConfig: SegmentationConfig = {
     minPauseDurationMs: 120, 
-    velocityThreshold: 0.15, 
+    velocityThreshold: 0.10,
     positionVarianceThreshold: 0.015,
     bufferSize: 10, 
     minPointsForVariance: 5, 
@@ -47,7 +47,7 @@ const defaultConfig: SegmentationConfig = {
     velocityHistoryMaxSize: 100, 
     reasonableMaxSpeed: 3.0,
     velocityHighThresholdMultiplier: 1.5, 
-    minAbsoluteHighThreshold: 0.12,
+    minAbsoluteHighThreshold: 0.16,
     restartCooldownMs: 100,
     minRestartDistance: 0.04,
     readyAnimationDurationMs: 50,
